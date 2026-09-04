@@ -1,0 +1,23 @@
+{
+  "source": "my-pipeline",
+  "events": [
+    {"type": "market", "ts": "2026-03-02T14:00:00Z", "market_id": "GOV-X-2026",
+     "title": "Will candidate X win?", "outcomes": ["YES", "NO"]},
+    {"type": "market_status", "ts": "2026-03-02T14:00:00Z", "market_id": "GOV-X-2026",
+     "status": "open"},
+    {"type": "book_snapshot", "ts": "2026-03-02T14:00:01Z", "market_id": "GOV-X-2026",
+     "outcome": "YES",
+     "bids": [{"price": 0.58, "size": 500}, [0.57, 900]],
+     "asks": [{"price": 0.60, "size": 450}, [0.61, 700]]},
+    {"type": "trade", "ts": "2026-03-02T14:00:05Z", "market_id": "GOV-X-2026",
+     "outcome": "YES", "side": "buy", "price": 0.60, "size": 120, "trade_id": "g-1"},
+    {"type": "book_delta", "ts": "2026-03-02T14:00:05.100Z", "market_id": "GOV-X-2026",
+     "outcome": "YES", "side": "ask", "price": 0.60, "size": 330},
+    {"type": "trade", "ts": "2026-03-02T14:00:09Z", "market_id": "GOV-X-2026",
+     "outcome": "YES", "side": "sell", "price": 0.58, "size": 60, "trade_id": "g-2"},
+    {"type": "market_status", "ts": "2026-03-02T18:00:00Z", "market_id": "GOV-X-2026",
+     "status": "closed"},
+    {"type": "resolution", "ts": "2026-03-02T18:05:00Z", "market_id": "GOV-X-2026",
+     "outcome": "YES", "settlement": 1.0}
+  ]
+}

@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: uv sync
+      - name: Format check
+        run: uv run ruff format --check .
+      - name: Lint
+        run: uv run ruff check .
+      - name: Test
+        run: uv run pytest
+      - name: Demo commands
+        run: |
+          uv run opentape inspect examples/sample.parquet
+          uv run opentape replay examples/sample.parquet --limit 5
+          uv run opentape convert examples/fixtures/kalshi_style.json --format kalshi-style -o /tmp/k.parquet
+          uv run opentape inspect /tmp/k.parquet

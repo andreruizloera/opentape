@@ -1,0 +1,7 @@
+type,ts,market_id,outcome,side,price,size,status,title,outcomes,source
+market,2026-03-02T14:00:00Z,CSV-MKT,,,,,,"Example market from CSV",YES|NO,csv-feed
+market_status,2026-03-02T14:00:00Z,CSV-MKT,,,,,open,,,csv-feed
+trade,2026-03-02T14:01:00Z,CSV-MKT,YES,buy,0.52,10,,,,csv-feed
+trade,2026-03-02T14:02:30Z,CSV-MKT,YES,sell,0.51,40,,,,csv-feed
+trade,2026-03-02T14:02:30Z,CSV-MKT,YES,buy,0.52,15,,,,csv-feed
+resolution,2026-03-02T20:00:00Z,CSV-MKT,YES,,1.0,,,,,csv-feed

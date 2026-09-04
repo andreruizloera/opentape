@@ -1,0 +1,40 @@
+{
+  "market": {
+    "ticker": "FEDCUT-26SEP",
+    "title": "Will the Fed cut rates at the September 2026 meeting?",
+    "open_time": "2026-03-01T14:00:00Z",
+    "status": "active"
+  },
+  "orderbook_snapshots": [
+    {
+      "ticker": "FEDCUT-26SEP",
+      "ts": "2026-03-02T14:30:00Z",
+      "orderbook": {
+        "yes": [[61, 500], [60, 900], [59, 1200]],
+        "no": [[37, 450], [36, 800], [35, 1500]]
+      }
+    }
+  ],
+  "orderbook_deltas": [
+    {"ticker": "FEDCUT-26SEP", "ts": "2026-03-02T14:30:04Z", "price": 61, "delta": -100, "side": "yes"},
+    {"ticker": "FEDCUT-26SEP", "ts": "2026-03-02T14:30:06Z", "price": 38, "delta": 250, "side": "no"},
+    {"ticker": "FEDCUT-26SEP", "ts": "2026-03-02T14:30:09Z", "price": 61, "delta": -400, "side": "yes"}
+  ],
+  "trades": [
+    {
+      "trade_id": "a1f0", "ticker": "FEDCUT-26SEP",
+      "created_time": "2026-03-02T14:30:05Z",
+      "yes_price": 62, "count": 40, "taker_side": "yes"
+    },
+    {
+      "trade_id": "a1f1", "ticker": "FEDCUT-26SEP",
+      "created_time": "2026-03-02T14:30:07Z",
+      "yes_price": 61, "count": 25, "taker_side": "no"
+    },
+    {
+      "trade_id": "a1f2", "ticker": "FEDCUT-26SEP",
+      "created_time": "2026-03-02T14:30:12Z",
+      "yes_price": 63, "count": 110, "taker_side": "yes"
+    }
+  ]
+}

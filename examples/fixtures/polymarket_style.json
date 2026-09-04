@@ -1,0 +1,44 @@
+{
+  "market": {
+    "condition_id": "0x3b1e9f27c4",
+    "question": "Will candidate X win the 2026 governor's race?",
+    "outcomes": ["Yes", "No"],
+    "created_at": "2026-02-15T00:00:00Z",
+    "active": true
+  },
+  "books": [
+    {
+      "market": "0x3b1e9f27c4",
+      "outcome": "Yes",
+      "timestamp": 1772461800000,
+      "bids": [
+        {"price": "0.61", "size": "400"},
+        {"price": "0.60", "size": "1200"},
+        {"price": "0.58", "size": "2500"}
+      ],
+      "asks": [
+        {"price": "0.63", "size": "350"},
+        {"price": "0.64", "size": "900"},
+        {"price": "0.66", "size": "1800"}
+      ]
+    }
+  ],
+  "price_changes": [
+    {"market": "0x3b1e9f27c4", "outcome": "Yes", "price": "0.61", "size": "250", "side": "BUY", "timestamp": 1772461810},
+    {"market": "0x3b1e9f27c4", "outcome": "Yes", "price": "0.63", "size": "0", "side": "SELL", "timestamp": 1772461815}
+  ],
+  "trades": [
+    {
+      "id": "tr-9001", "market": "0x3b1e9f27c4", "outcome": "Yes",
+      "price": "0.62", "size": "150.5", "side": "BUY", "timestamp": 1772461805
+    },
+    {
+      "id": "tr-9002", "market": "0x3b1e9f27c4", "outcome": "Yes",
+      "price": "0.63", "size": "75", "side": "BUY", "timestamp": 1772461812
+    },
+    {
+      "id": "tr-9003", "market": "0x3b1e9f27c4", "outcome": "Yes",
+      "price": "0.61", "size": "300", "side": "SELL", "timestamp": 1772461818
+    }
+  ]
+}
