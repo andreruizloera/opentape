@@ -108,6 +108,47 @@ $ opentape replay btc.parquet --limit 6
 [2026-09-07T04:24:10.083Z] seq=     5 BOOK_DELTA  btc-updown-5m-1788755100 ask  0.52 set 214.38
 ```
 
+### Reading the book back
+
+A tape stores a book as one snapshot plus per-level changes, which is
+compact but is not a book you can read. `opentape book` folds it back
+into a ladder, at the end of the tape or at any moment inside it. On
+the capture above, forty seconds apart:
+
+```
+$ opentape book btc.parquet --at 2026-09-07T04:24:30Z --depth 3
+market   : btc-updown-5m-1788755100
+as of    : 2026-09-07T04:24:29.662Z
+built    : snapshot at 2026-09-07T04:24:08.743Z plus 114 deltas
+top      : 0.4900 / 0.5000  (mid 0.4950, spread 0.0100)
+levels   : 49 bid, 50 ask
+
+      bid size     bid | ask     ask size
+         32.27  0.4900 | 0.5000  158.00
+         81.00  0.4800 | 0.5100  158.00
+         87.50  0.4700 | 0.5200  214.40
+
+$ opentape book btc.parquet --depth 3
+market   : btc-updown-5m-1788755100
+as of    : 2026-09-07T04:25:09.002Z
+built    : snapshot at 2026-09-07T04:24:08.743Z plus 1,256 deltas
+top      : 0.6300 / 0.6400  (mid 0.6350, spread 0.0100)
+levels   : 63 bid, 36 ask
+
+      bid size     bid | ask     ask size
+         29.35  0.6300 | 0.6400  267.33
+        183.00  0.6200 | 0.6500  153.76
+         60.00  0.6100 | 0.6600  130.00
+```
+
+A book cannot be rebuilt from deltas alone: a delta says what one
+level became, never what the rest of the book was. A time with no
+snapshot before it is therefore an error rather than a book made only
+of the levels that happened to change. `Tape.book_at(market_id, ts)`
+is the same thing from Python, and the returned `OrderBook` carries
+`best_bid`, `best_ask`, `spread`, `mid`, and the snapshot and delta
+count it was built from.
+
 That tape is an ordinary tape, so the rest of the tooling works on it:
 
 ```
@@ -219,6 +260,10 @@ for event in tape.replay(speed="max"):
 # DuckDB SQL over the tape's views:
 # events, markets, snapshots, deltas, trades, status, resolutions.
 tape.sql("SELECT * FROM trades WHERE price > 0.7")
+
+# Rebuild the order book at any moment on the tape.
+book = tape.book_at("OT-FEDCUT-SEP26")
+book.best_bid, book.best_ask, book.spread, book.mid
 ```
 
 The SQL example, for real:
@@ -252,6 +297,8 @@ build events, then `Tape.from_events(events).write("out.parquet")`.
 opentape inspect examples/sample.parquet
 opentape replay  examples/sample.parquet --speed 60
 opentape replay  examples/sample.parquet --limit 50      # speed defaults to "max"
+opentape book    examples/sample.parquet --market OT-FEDCUT-SEP26 --depth 5
+opentape book    tape.parquet --at 2026-09-07T04:24:30Z
 opentape convert data.json --format kalshi-style -o tape.parquet
 opentape convert data.json --format polymarket-style
 opentape convert events.csv --format generic
@@ -321,7 +368,8 @@ src/opentape/
   schema.py        the canonical column set, dtypes, validation, SCHEMA_VERSION
   events.py        typed event classes and the row <-> event mapping
   tape.py          Tape: read/write Parquet, replay pacing, DuckDB views, summary
-  cli.py           opentape inspect | replay | convert | markets | capture
+  book.py          fold snapshots and deltas back into an order book (pure)
+  cli.py           opentape inspect | replay | convert | book | markets | capture
   synthetic.py     seeded synthetic tape generator (bursts, drift, resolution)
   adapters/
     generic.py            canonical-shaped CSV/JSON
@@ -381,8 +429,8 @@ windows with heavier trading, and two resolutions.
 ## Roadmap
 
 See ROADMAP.md. Highlights: websocket transports for both venues,
-authenticated feeds, book reconstruction and top-of-book derivation,
-tape slicing and merging, multi-file datasets, and a PyPI release.
+authenticated feeds, tape slicing and merging, multi-file datasets,
+and a PyPI release.
 
 ## Contributing
 

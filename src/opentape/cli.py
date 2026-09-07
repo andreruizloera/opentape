@@ -145,6 +145,54 @@ def _cmd_convert(args: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_at(raw: str | None) -> datetime | None:
+    if raw is None:
+        return None
+    try:
+        ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        raise OpenTapeError(
+            f"--at must be an ISO 8601 timestamp such as 2026-09-07T04:25:00Z, got {raw!r}"
+        ) from None
+    if ts.tzinfo is None:
+        raise OpenTapeError(f"--at timestamp {raw!r} has no timezone; use an offset or a Z suffix")
+    return ts
+
+
+def _cmd_book(args: argparse.Namespace) -> int:
+    tape = Tape.read(args.tape)
+    market = args.market
+    if market is None:
+        markets = tape.market_ids()
+        if len(markets) != 1:
+            raise OpenTapeError(
+                f"this tape has {len(markets)} markets, so --market is required: "
+                f"{', '.join(markets) or 'none'}"
+            )
+        market = markets[0]
+
+    book = tape.book_at(market, _parse_at(args.at))
+    shown = book.depth(args.depth)
+    print(f"market   : {book.market_id}")
+    print(f"as of    : {_fmt_ts(book.as_of)}")
+    print(f"built    : snapshot at {_fmt_ts(book.snapshot_ts)} plus {book.deltas_applied:,} deltas")
+    if book.spread is not None and book.mid is not None:
+        print(f"top      : {book.best_bid.price:.4f} / {book.best_ask.price:.4f}", end="")  # type: ignore[union-attr]
+        print(f"  (mid {book.mid:.4f}, spread {book.spread:.4f})")
+    else:
+        print("top      : one-sided book, no spread or mid")
+    print(f"levels   : {len(book.bids)} bid, {len(book.asks)} ask")
+    print()
+    print(f"{'bid size':>14}  {'bid':>6} | {'ask':<6}  {'ask size':<14}")
+    for i in range(max(len(shown.bids), len(shown.asks))):
+        bid = shown.bids[i] if i < len(shown.bids) else None
+        ask = shown.asks[i] if i < len(shown.asks) else None
+        left = f"{bid.size:>14,.2f}  {bid.price:>6.4f}" if bid else " " * 22
+        right = f"{ask.price:<6.4f}  {ask.size:<,.2f}" if ask else ""
+        print(f"{left} | {right}".rstrip())
+    return 0
+
+
 def _cmd_markets(args: argparse.Namespace) -> int:
     source = build_source(args.venue, HttpFetcher(timeout=args.timeout))
     refs = source.list_markets(limit=args.limit, search=args.search)
@@ -226,6 +274,26 @@ def build_parser() -> argparse.ArgumentParser:
         "-o", "--output", default=None, help="output .parquet path (default: input with .parquet)"
     )
     p_convert.set_defaults(func=_cmd_convert)
+
+    p_book = sub.add_parser(
+        "book",
+        help="rebuild an order book from a tape's snapshots and deltas",
+        description="Fold a tape's snapshots and the deltas that follow them back into a "
+        "readable ladder. A book cannot be rebuilt from deltas alone, so a time with no "
+        "snapshot before it is an error rather than a partial book.",
+    )
+    p_book.add_argument("tape", help="path to a .parquet tape")
+    p_book.add_argument(
+        "--market", default=None, help="market id (optional when the tape holds only one)"
+    )
+    p_book.add_argument(
+        "--at",
+        default=None,
+        metavar="TS",
+        help="ISO 8601 timestamp to rebuild at (default: the end of the tape)",
+    )
+    p_book.add_argument("--depth", type=int, default=10, help="levels to print per side")
+    p_book.set_defaults(func=_cmd_book)
 
     p_markets = sub.add_parser("markets", help="list open markets on a live venue")
     p_markets.add_argument("--venue", required=True, choices=sorted(SOURCES), help="venue to query")

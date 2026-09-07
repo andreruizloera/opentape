@@ -4,7 +4,8 @@ from __future__ import annotations
 
 __version__ = "0.1.0"
 
-from opentape.errors import AdapterError, OpenTapeError, SchemaError
+from opentape.book import OrderBook, reconstruct
+from opentape.errors import AdapterError, LiveError, OpenTapeError, SchemaError
 from opentape.events import (
     BookDelta,
     BookLevel,
@@ -25,9 +26,11 @@ __all__ = [
     "BookDelta",
     "BookLevel",
     "Event",
+    "LiveError",
     "Market",
     "MarketStatus",
     "OpenTapeError",
+    "OrderBook",
     "OrderBookSnapshot",
     "Resolution",
     "SchemaError",
@@ -35,4 +38,5 @@ __all__ = [
     "TapeSummary",
     "Trade",
     "__version__",
+    "reconstruct",
 ]

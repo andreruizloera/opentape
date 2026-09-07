@@ -42,14 +42,21 @@ open:
 
 ## Tools
 
-- `opentape book`: reconstruct and print the order book at any
-  timestamp by folding snapshots and deltas.
+`opentape book` SHIPPED: it folds a tape's snapshots and deltas back
+into a ladder at any timestamp, and `Tape.book_at()` is the same thing
+from Python. What is still open:
+
+- Top-of-book and mid-price time series derivation, so a backtest can
+  get every quote change as a series instead of asking for one book at
+  a time. `book.py` already computes the top of a single book; the
+  missing piece is doing it incrementally across a whole tape without
+  refolding from the snapshot each time.
+- Cumulative depth and a notional column in the printed ladder, plus a
+  `--json` output for piping.
 - `opentape slice`: cut a tape by time range or market into a new
   valid tape; `opentape merge` for the reverse.
 - `opentape diff`: compare two tapes of the same market from
   different sources.
-- Top-of-book and mid-price time series derivation helpers for
-  backtesting loops.
 
 ## Distribution
 

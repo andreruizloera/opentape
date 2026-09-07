@@ -12,6 +12,7 @@ import duckdb
 import polars as pl
 
 from opentape import schema
+from opentape.book import OrderBook, reconstruct
 from opentape.errors import OpenTapeError, SchemaError
 from opentape.events import Event, from_row, to_row
 
@@ -186,6 +187,36 @@ class Tape:
                     sleep(gap)
             prev_ts = ts
             yield from_row(row)
+
+    # -- order book --------------------------------------------------------
+
+    def book_at(self, market_id: str, ts: datetime | None = None) -> OrderBook:
+        """Rebuild ``market_id``'s order book as of ``ts``.
+
+        ``ts`` defaults to the end of the tape. The result is built from
+        the last snapshot at or before ``ts`` plus every delta between
+        the two, and it carries both of those facts so a caller can see
+        how it was derived. Raises :class:`OpenTapeError` when the
+        market is not on the tape, or when no snapshot precedes ``ts``.
+        """
+        if market_id not in self.market_ids():
+            known = ", ".join(self.market_ids()) or "none"
+            raise OpenTapeError(f"no market {market_id!r} on this tape; markets: {known}")
+        if ts is None:
+            rng = self.time_range()
+            if rng is None:
+                raise OpenTapeError("cannot rebuild a book from an empty tape")
+            ts = rng[1]
+        elif ts.tzinfo is None:
+            raise OpenTapeError(f"timestamp {ts!r} is naive; pass a timezone-aware datetime")
+
+        window = self._df.filter(
+            (pl.col("market_id") == market_id)
+            & pl.col("event_type").is_in([schema.EVENT_SNAPSHOT, schema.EVENT_DELTA])
+            & (pl.col("ts") <= ts)
+        )
+        events = (from_row(row) for row in window.iter_rows(named=True))
+        return reconstruct(events, market_id=market_id)
 
     # -- SQL ---------------------------------------------------------------
 

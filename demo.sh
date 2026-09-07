@@ -13,6 +13,7 @@ run uv run opentape inspect /tmp/opentape-demo-kalshi.parquet
 run uv run opentape convert examples/fixtures/polymarket_style.json \
     --format polymarket-style -o /tmp/opentape-demo-poly.parquet
 run uv run opentape replay /tmp/opentape-demo-poly.parquet
+run uv run opentape book examples/sample.parquet --market OT-FEDCUT-SEP26 --depth 5
 
 echo
 echo "\$ python: tape.sql(...)"

@@ -30,3 +30,4 @@ run uv run opentape capture --venue "$VENUE" --market "$MARKET" \
     -o "$OUT" --poll 2s --duration "$DURATION"
 run uv run opentape inspect "$OUT"
 run uv run opentape replay "$OUT" --limit 10
+run uv run opentape book "$OUT" --depth 5

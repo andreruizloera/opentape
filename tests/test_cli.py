@@ -111,6 +111,57 @@ def test_convert_bad_input_errors_cleanly(tmp_path: Path, capsys) -> None:
     assert "not valid JSON" in capsys.readouterr().err
 
 
+# -- book -----------------------------------------------------------------
+
+
+def test_book_prints_a_ladder_with_its_provenance(tape_file: Path, capsys) -> None:
+    assert main(["book", str(tape_file)]) == 0
+    out = capsys.readouterr().out
+    assert "market   : M1" in out
+    assert "built    : snapshot at 2026-03-02T14:30:01.000Z plus 1 deltas" in out
+    assert "top      : 0.5800 / 0.6000  (mid 0.5900, spread 0.0200)" in out
+    assert "0.5800 | 0.6000" in out
+
+
+def test_book_rebuilds_at_a_given_time(tape_file: Path, capsys) -> None:
+    assert main(["book", str(tape_file), "--at", "2026-03-02T14:30:01Z"]) == 0
+    out = capsys.readouterr().out
+    assert "plus 0 deltas" in out
+    # The ask at 0.60 is still 450 before the delta at t=2 sets it to 350.
+    assert "450.00" in out
+
+
+def test_book_depth_limits_the_ladder(tape_file: Path, capsys) -> None:
+    assert main(["book", str(tape_file), "--depth", "1"]) == 0
+    rows = [ln for ln in capsys.readouterr().out.splitlines() if "|" in ln]
+    assert len(rows) == 2  # the header row plus one level
+
+
+def test_book_requires_a_market_when_the_tape_has_several(tmp_path: Path, capsys) -> None:
+    tape = Tape.read(FIXTURES.parent / "sample.parquet")
+    path = tmp_path / "many.parquet"
+    tape.write(path)
+    assert main(["book", str(path)]) == 1
+    assert "--market is required" in capsys.readouterr().err
+
+
+def test_book_rejects_a_timestamp_it_cannot_parse(tape_file: Path, capsys) -> None:
+    assert main(["book", str(tape_file), "--at", "yesterday"]) == 1
+    assert "--at must be an ISO 8601 timestamp" in capsys.readouterr().err
+
+
+def test_book_rejects_a_timestamp_with_no_timezone(tape_file: Path, capsys) -> None:
+    assert main(["book", str(tape_file), "--at", "2026-03-02T14:30:05"]) == 1
+    assert "no timezone" in capsys.readouterr().err
+
+
+def test_book_before_the_first_snapshot_errors_without_a_traceback(tape_file: Path, capsys) -> None:
+    assert main(["book", str(tape_file), "--at", "2026-03-02T14:30:00Z"]) == 1
+    err = capsys.readouterr().err
+    assert "cannot be rebuilt from deltas alone" in err
+    assert "Traceback" not in err
+
+
 # -- capture and markets --------------------------------------------------
 #
 # The CLI builds its own HttpFetcher, so these swap that class for one
