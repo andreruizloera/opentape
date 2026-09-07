@@ -173,11 +173,32 @@ class PolymarketLive(LiveSource):
 
     # -- resolution --------------------------------------------------------
 
-    def _resolve(self, market_id: str) -> _Resolved:
-        if market_id in self._cache:
-            return self._cache[market_id]
+    def _resolve(self, market_id: str, *, refresh: bool = False) -> _Resolved:
+        """Return the market document, from cache unless asked for a fresh read.
+
+        The cache exists so that ``book`` and ``trades`` do not re-resolve
+        a market on every poll, and what it holds is stable: the
+        condition id, the two outcome tokens, the question, the
+        outcomes. The market's LIFECYCLE is not stable, and serving a
+        cached document to a status check would report the status the
+        market had when the capture started for as long as the capture
+        ran. So :meth:`describe` asks for a fresh read and nothing else
+        does.
+
+        A refresh costs one request, not two: the condition id is
+        already known, so a slug does not have to be resolved again.
+        That is ``condition_id`` and NOT ``market_id``, which is the
+        SLUG whenever the venue publishes one, because the slug is the
+        canonical spelling for the tape while the CLOB's market endpoint
+        only answers to a condition id.
+        """
+        cached = self._cache.get(market_id)
+        if cached is not None and not refresh:
+            return cached
         condition = market_id
-        if not market_id.startswith("0x"):
+        if cached is not None:
+            condition = cached.condition_id
+        elif not market_id.startswith("0x"):
             condition = self._condition_from_slug(market_id)
         doc = self._fetch(f"{self._clob}/markets/{condition}")
         if not isinstance(doc, dict) or not doc.get("condition_id"):
@@ -203,7 +224,7 @@ class PolymarketLive(LiveSource):
     # -- data --------------------------------------------------------------
 
     def describe(self, market_id: str) -> MarketDescription:
-        resolved = self._resolve(market_id)
+        resolved = self._resolve(market_id, refresh=True)
         raw = resolved.raw
         if raw.get("closed"):
             status = "closed"

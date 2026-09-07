@@ -32,9 +32,20 @@ upgrade, so it needs a key. What is still open:
   count is bounded and a capture gives up rather than retrying forever,
   which is the right default for a fixed `--duration` and the wrong one
   for a daemon meant to run for a week.
-- Re-read a market's status while a capture runs, so a market that
-  closes or halts mid-capture records the change instead of keeping
-  the status it had when the capture started.
+- Optional debouncing for lifecycle flapping: require a status to hold
+  for N consecutive checks before writing a row. Polymarket has been
+  observed answering closed, open, then closed on three reads twenty
+  seconds apart, and today every one of those becomes a row. It stays
+  off by default, because "what the venue said when asked" is the
+  honest raw record and a smoothed one cannot be recovered from it.
+- Stop or narrow a capture once every market it tracks has closed.
+  Today `--status-every` records the close and the loop keeps polling a
+  book that will not move again, which is correct but wasteful on a
+  long `--duration`.
+- Resolution capture: a `resolution` row when a venue publishes the
+  winning outcome. `market_status` says the market stopped trading,
+  which is not the same as saying how it settled, and schema v1 already
+  has the event type.
 - Adaptive poll pacing: back off on a market whose book has not moved
   in a while and spend the request budget on the ones that are, which
   matters once a single capture tracks many markets.

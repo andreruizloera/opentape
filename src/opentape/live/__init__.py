@@ -29,6 +29,7 @@ from opentape.live.daemon import (
     StreamConfig,
     StreamDaemon,
     StreamStats,
+    TapeStats,
     parse_duration,
 )
 from opentape.live.http import Fetcher, HttpFetcher
@@ -104,6 +105,7 @@ __all__ = [
     "StreamDaemon",
     "StreamSource",
     "StreamStats",
+    "TapeStats",
     "TradeDeduper",
     "TradeTick",
     "build_source",

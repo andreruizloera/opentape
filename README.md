@@ -173,6 +173,33 @@ shape: (2, 5)
 `./demo_live.sh` runs that whole sequence against a market it picks
 itself. It is the one script here that needs the network.
 
+### A market that closes while you are recording it
+
+A capture re-reads each market's lifecycle status every `--status-every`
+(default 30s) and writes a `market_status` row at the point a change is
+observed. Both transports do it, because a change stream carries book
+and trade messages, not lifecycle. This part of `./demo.sh` runs a
+scripted venue rather than a real one so it works offline, but the
+daemon, the tape, and the status rows are the shipped ones:
+
+```
+$ python: a capture across a market's close
+tracking DEMO-CLOSE (open): Will the demo market close?
+DEMO-CLOSE changed status: open -> closed
+wrote /tmp/.../closing.parquet: 9 events
+status changes observed: 1
+  seq=1  15:20:00  status=open
+  seq=7  15:20:04  status=closed
+```
+
+The row is stamped when the change was **observed**, not when the venue
+made it: a poller cannot know the second one and does not guess. With
+`--rotate`, a segment that saw the close opens with `open` and carries
+the transition in its body, and every later segment opens with
+`closed`, so each segment still reads correctly on its own.
+
+`--no-status-check` restores the old behaviour of asking exactly once.
+
 ### Streaming instead of polling
 
 `--transport websocket` subscribes to the venue's change stream, so a
@@ -385,6 +412,10 @@ opentape capture --venue polymarket --market SLUG -o tape.parquet \
     --poll 1s --rotate 5m          # numbered segments, each a valid tape
 opentape capture --venue polymarket --market SLUG -o tape.parquet \
     --transport websocket --duration 10m    # the venue's change stream
+opentape capture --venue polymarket --market SLUG -o tape.parquet \
+    --status-every 10s             # re-read the lifecycle this often
+opentape capture --venue kalshi --market TICKER -o tape.parquet \
+    --no-status-check              # ask once at the start and never again
 ```
 
 `capture` runs until `--duration` elapses, or until Ctrl-C, which
@@ -392,10 +423,19 @@ stops after the current poll or message and writes what it has rather
 than discarding it. `--poll`, `--snapshot-every`, and `--backfill`
 belong to `rest-poll` and are refused with a reason under
 `--transport websocket`, where the venue sets the pace and publishes
-its own snapshots. `--rotate` writes `tape-0001.parquet`,
-`tape-0002.parquet`, and so on; every segment repeats the market
-definition rows for the markets in it, so a segment is readable on its
-own.
+its own snapshots. `--status-every` and `--no-status-check` apply to
+both, since neither venue publishes lifecycle changes on its stream.
+`--rotate` writes `tape-0001.parquet`, `tape-0002.parquet`, and so on;
+every segment repeats the market definition rows for the markets in
+it, so a segment is readable on its own.
+
+A lifecycle check that fails is counted and reported, never fatal. It
+reads a different endpoint than the book, so losing it should not throw
+away book and trade data that is arriving fine, and an unknown status
+is never written down as a change. A run whose checks failed prints
+`N status check(s) failed; the tape's status rows are as of the last
+check that succeeded` next to its summary, so the one case where the
+tape's status might be out of date says so.
 
 ### Adapters
 
@@ -510,8 +550,23 @@ windows with heavier trading, and two resolutions.
 - A streamed capture reconnects after a dropped connection, but what was
   missed while it was disconnected is gone. The tape re-snapshots rather
   than guessing, so the gap is visible, not filled.
-- A market's status is read once when the capture starts. A market that
-  closes mid-capture keeps its opening status on that tape.
+- **A status row records the venue's flags, not the market, and those
+  flags lag.** Polymarket's five-minute `btc-updown-5m-1788794400`
+  covers 15:20 to 15:25 UTC. Polled every 20 seconds on 2026-09-07 it
+  still reported `closed=false, accepting_orders=true` at 15:27, and
+  first reported closed at **15:37:02, about twelve minutes after its
+  window ended**. A row is stamped when the change was observed,
+  because a poller cannot know when the venue decided.
+- **The venue can disagree with itself between requests, and the tape
+  will show it.** In that same run the three consecutive reads at
+  15:37:02, 15:37:22, and 15:37:42 answered closed, then open, then
+  closed. opentape writes what it observed and does not debounce, so a
+  flapping venue produces flapping rows. Two status rows twenty seconds
+  apart are a fact about the endpoint, not about the market.
+- A status change is caught no sooner than the next `--status-every`,
+  so the row's time is an upper bound on when the change happened, not
+  the moment it did. Shortening the interval costs one request per
+  market per check on a different endpoint than the book.
 - Polymarket's public trades endpoint publishes no per-fill id, so
   deduplication uses a composite key (transaction, taker, token, size,
   price). Two identical fills by one taker in one transaction would

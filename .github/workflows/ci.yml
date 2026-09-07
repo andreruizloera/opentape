@@ -41,3 +41,21 @@ jobs:
           fi
           grep -q 'requires an API key' /tmp/refusal.txt
           grep -q 'transport rest-poll' /tmp/refusal.txt
+          # Contradictory lifecycle flags are refused before any work.
+          if uv run opentape capture --venue polymarket --market X -o /tmp/no.parquet \
+                 --status-every 10s --no-status-check > /tmp/contradiction.txt 2>&1; then
+            echo "expected a nonzero exit for --status-every with --no-status-check" >&2
+            exit 1
+          fi
+          grep -q 'contradict each other' /tmp/contradiction.txt
+
+      - name: Offline demo
+        run: |
+          ./demo.sh > /tmp/demo.txt 2>&1 || { cat /tmp/demo.txt; exit 1; }
+          # The close-mid-capture lines the README pastes. They are the
+          # whole point of that demo part, so drift should fail here
+          # rather than be discovered by a reader.
+          grep -q 'DEMO-CLOSE changed status: open -> closed' /tmp/demo.txt
+          grep -q 'status changes observed: 1' /tmp/demo.txt
+          grep -q 'seq=1  15:20:00  status=open' /tmp/demo.txt
+          grep -q 'seq=7  15:20:04  status=closed' /tmp/demo.txt

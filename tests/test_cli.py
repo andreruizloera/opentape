@@ -346,3 +346,86 @@ def test_the_default_transport_is_still_polling(offline: FakeFetcher, tmp_path: 
         == 0
     )
     assert "polymarket-rest-poll" in set(Tape.read(out).frame["source"].to_list())
+
+
+# -- capture --status-every -----------------------------------------------
+
+
+def _capture_args(tmp_path: Path, *extra: str) -> list[str]:
+    return [
+        "capture",
+        "--venue",
+        "polymarket",
+        "--market",
+        "xi-jinping-out-before-2027",
+        "-o",
+        str(tmp_path / "o.parquet"),
+        "--poll",
+        "1ms",
+        "--duration",
+        "3ms",
+        *extra,
+    ]
+
+
+def test_status_every_and_no_status_check_contradict_each_other(
+    offline: FakeFetcher, tmp_path: Path, capsys
+) -> None:
+    code = main(_capture_args(tmp_path, "--status-every", "10s", "--no-status-check"))
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "contradict each other" in err
+    assert "Traceback" not in err
+
+
+def test_a_bad_status_interval_names_its_own_flag(
+    offline: FakeFetcher, tmp_path: Path, capsys
+) -> None:
+    code = main(_capture_args(tmp_path, "--status-every", "whenever"))
+    assert code == 1
+    assert "--status-every must be a duration" in capsys.readouterr().err
+
+
+def test_no_status_check_is_accepted_on_its_own(
+    offline: FakeFetcher, tmp_path: Path, capsys
+) -> None:
+    assert main(_capture_args(tmp_path, "--no-status-check", "--quiet")) == 0
+    assert "captured" in capsys.readouterr().out
+
+
+def test_a_capture_that_saw_no_status_change_says_nothing_about_status(
+    offline: FakeFetcher, tmp_path: Path, capsys
+) -> None:
+    # A quiet run should stay quiet. The line only appears when there is
+    # something to report.
+    assert main(_capture_args(tmp_path, "--quiet")) == 0
+    printed = capsys.readouterr().out
+    assert "status change" not in printed
+    assert "status check" not in printed
+
+
+def test_the_websocket_transport_accepts_the_status_flags(tmp_path: Path) -> None:
+    # --status-every applies to BOTH transports, unlike --poll and
+    # --snapshot-every, so it must not land in the refusal list. Checked
+    # against the parser rather than by running a capture, because the
+    # flag being accepted is exactly the case that goes on to open a
+    # real socket.
+    from opentape.cli import _status_every, build_parser
+
+    args = build_parser().parse_args(_ws_args(tmp_path, "--status-every", "5s"))
+    assert args.transport == "websocket"
+    assert _status_every(args) == 5.0
+
+
+def test_the_status_interval_defaults_to_thirty_seconds(tmp_path: Path) -> None:
+    from opentape.cli import _status_every, build_parser
+
+    args = build_parser().parse_args(_capture_args(tmp_path))
+    assert _status_every(args) == 30.0
+
+
+def test_no_status_check_resolves_to_never_asking_again(tmp_path: Path) -> None:
+    from opentape.cli import _status_every, build_parser
+
+    args = build_parser().parse_args(_capture_args(tmp_path, "--no-status-check"))
+    assert _status_every(args) is None

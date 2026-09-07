@@ -353,3 +353,103 @@ def test_the_two_sources_tag_the_transport_not_just_the_venue() -> None:
     # source column has to say which one a reader is holding.
     assert KalshiLive.source_tag == "kalshi-rest-poll"
     assert PolymarketLive.source_tag == "polymarket-rest-poll"
+
+
+# -- Polymarket: the lifecycle is not cached ------------------------------
+
+
+class MutableFetcher(FakeFetcher):
+    """A fetcher whose market document can be changed between calls.
+
+    The market route answers ONLY the condition id, exactly as the real
+    CLOB does. A fake that also answered the slug would have hidden a
+    real bug: a refresh that re-requested the slug returned HTTP 404
+    against the live venue, and the permissive fake passed.
+    """
+
+    def __init__(self, routes: dict[str, Any], market: dict[str, Any]) -> None:
+        super().__init__(routes)
+        self.market = market
+
+    def __call__(self, url: str, params: dict[str, Any] | None = None) -> Any:
+        if "/markets/" in url and "sampling" not in url:
+            self.calls.append((url, params))
+            if not url.endswith(self.market["condition_id"]):
+                raise LiveError(f"polymarket: market not found for {url!r}")
+            return self.market
+        return super().__call__(url, params)
+
+
+def mutable_polymarket() -> tuple[PolymarketLive, MutableFetcher]:
+    market = dict(load("polymarket_market.json"))
+    routes: dict[str, Any] = {
+        "/sampling-markets": load("polymarket_sampling_markets.json"),
+        "/book": load("polymarket_book.json"),
+        "data-api": load("polymarket_trades.json"),
+        "gamma-api": [{"conditionId": market["condition_id"]}],
+    }
+    fetch = MutableFetcher(routes, market)
+    return PolymarketLive(fetch), fetch
+
+
+def test_polymarket_describe_sees_a_market_that_closed_since_the_last_call() -> None:
+    # The resolution cache holds identity, which is stable. Serving it
+    # to a status check would report the market's opening status for as
+    # long as a capture ran, which is exactly what the capture daemon's
+    # periodic re-read is there to avoid.
+    source, fetch = mutable_polymarket()
+    assert source.describe(SLUG).status == "open"
+
+    fetch.market = dict(fetch.market, closed=True)
+    assert source.describe(SLUG).status == "closed"
+
+
+def test_polymarket_describe_sees_a_halt_and_a_resume() -> None:
+    source, fetch = mutable_polymarket()
+    assert source.describe(SLUG).status == "open"
+
+    fetch.market = dict(fetch.market, accepting_orders=False)
+    assert source.describe(SLUG).status == "halted"
+
+    fetch.market = dict(fetch.market, accepting_orders=True)
+    assert source.describe(SLUG).status == "open"
+
+
+def test_polymarket_a_refreshed_slug_is_not_resolved_through_gamma_twice() -> None:
+    # A refresh re-reads the market document; the condition id is
+    # already known, so it must not cost the slug lookup again.
+    source, fetch = mutable_polymarket()
+    source.describe(SLUG)
+    gamma_first = sum(1 for url, _ in fetch.calls if "gamma-api" in url)
+    source.describe(SLUG)
+    gamma_after = sum(1 for url, _ in fetch.calls if "gamma-api" in url)
+    assert gamma_first == 1
+    assert gamma_after == 1
+
+
+def test_polymarket_book_and_trades_still_use_the_cache() -> None:
+    # The refresh is scoped to describe(). A poll loop asking for the
+    # book every second must not re-resolve the market every second.
+    source, fetch = mutable_polymarket()
+    source.describe(SLUG)
+    before = len([1 for url, _ in fetch.calls if "/markets/" in url])
+    for _ in range(5):
+        source.book(SLUG)
+        source.trades(SLUG)
+    after = len([1 for url, _ in fetch.calls if "/markets/" in url])
+    assert after == before
+
+
+def test_polymarket_a_refresh_asks_the_clob_by_condition_id_not_by_slug() -> None:
+    # The CLOB's market endpoint answers to a condition id only. The
+    # tape's canonical spelling is the SLUG, so a refresh that reuses
+    # the canonical id gets HTTP 404 from the live venue and every
+    # status check fails silently into a counter.
+    source, fetch = mutable_polymarket()
+    source.describe(SLUG)
+    source.describe(SLUG)
+    market_calls = [url for url, _ in fetch.calls if "/markets/" in url]
+    assert len(market_calls) == 2
+    for url in market_calls:
+        assert url.endswith(fetch.market["condition_id"])
+        assert SLUG not in url

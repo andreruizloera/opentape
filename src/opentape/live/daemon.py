@@ -22,6 +22,11 @@ polled tape can be trusted to say:
   unknown amount, so the next successful poll for that market emits a
   full snapshot rather than deltas measured against a book that was
   never confirmed.
+- A market's lifecycle status is re-read on an interval, not once. A
+  market that closes or halts while the capture is running gets a
+  ``market_status`` row at the point the change was observed, and a
+  segment written after that point opens with the new status rather
+  than the one the capture started with.
 """
 
 from __future__ import annotations
@@ -91,6 +96,11 @@ class CaptureConfig:
     #: first poll. Zero, the default, means the tape contains only
     #: trades that were seen to arrive while the capture was running.
     backfill: int = 0
+    #: Seconds between lifecycle re-reads, or None to ask only once at
+    #: the start. This is separate from ``poll_interval`` because it
+    #: costs an extra request per market and a market's status changes
+    #: on a different timescale than its book.
+    status_every: float | None = 30.0
 
 
 @dataclass(slots=True)
@@ -102,6 +112,12 @@ class TapeStats:
     snapshots: int = 0
     deltas: int = 0
     files: list[Path] = field(default_factory=list)
+    #: Lifecycle transitions observed while capturing, excluding the
+    #: opening status every tape carries anyway.
+    status_changes: int = 0
+    #: Lifecycle re-reads that raised. These are counted rather than
+    #: fatal; see :meth:`_TapeCapture._recheck_status`.
+    status_check_failures: int = 0
 
 
 @dataclass(slots=True)
@@ -139,11 +155,79 @@ class _TapeCapture:
         self._segment = 0
         self._stopping = False
         self._descriptions: dict[str, MarketDescription] = {}
+        #: The status each market had when the CURRENT segment began,
+        #: which is what that segment's header row must state. It lags
+        #: :attr:`_descriptions` by one flush on purpose; see
+        #: :meth:`_prepare_segment`.
+        self._segment_status: dict[str, str] = {}
+        #: Canonical market id back to the spelling the user typed,
+        #: which is the one a later ``describe()`` is given. A venue can
+        #: accept several spellings and only the user's is known to
+        #: work, since it is the one that resolved at the start.
+        self._requested: dict[str, str] = {}
         self.stats = stats
 
     def stop(self) -> None:
         """Ask the loop to finish what it is doing and flush."""
         self._stopping = True
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def _track(self, described: MarketDescription, requested: str) -> None:
+        """Record a market's opening description, before anything is captured."""
+        self._descriptions[described.market_id] = described
+        self._segment_status[described.market_id] = described.status
+        self._requested[described.market_id] = requested
+        self._log(f"tracking {described.market_id} ({described.status}): {described.title}")
+
+    def _observe_status(self, market_id: str, status: str, ts: datetime) -> bool:
+        """Record a lifecycle status, emitting a row only if it changed.
+
+        The tape already opens with a status row per segment, so
+        re-emitting an unchanged status on every check would fill a
+        long capture with rows that say nothing. Only a transition is
+        an event.
+        """
+        held = self._descriptions.get(market_id)
+        if held is None or held.status == status:
+            return False
+        self._descriptions[market_id] = replace(held, status=status)
+        self._emit(
+            MarketStatus(
+                seq=0,
+                ts=ts,
+                market_id=market_id,
+                source=self._source_tag,
+                status=status,
+            )
+        )
+        self.stats.status_changes += 1
+        self._log(f"{market_id} changed status: {held.status} -> {status}")
+        return True
+
+    def _recheck_status(self, describe: Callable[[str], MarketDescription], ts: datetime) -> None:
+        """Re-read every tracked market's status and record any change.
+
+        A failed re-read is counted and logged, never fatal, and never
+        touches the held status. The lifecycle check is a secondary
+        reader of a different endpoint than the book, so letting it end
+        a capture would mean losing book and trade data that was
+        arriving perfectly well. An unknown status is also not a
+        change: writing one down because a request timed out would put
+        a claim on the tape that nothing observed.
+        """
+        for canonical in list(self._descriptions):
+            try:
+                described = describe(self._requested.get(canonical, canonical))
+            except LiveError as exc:
+                self.stats.status_check_failures += 1
+                self._log(f"status check failed for {canonical}: {exc}")
+                continue
+            # Recorded against the id the tape already uses, not against
+            # whatever this call resolved to. The canonical spelling was
+            # decided once at the start; a tape whose rows disagree
+            # about the identifier is not queryable by market.
+            self._observe_status(canonical, described.status, ts)
 
     def _emit(self, event: Event) -> None:
         """Buffer an observed event, in the order it was observed."""
@@ -175,6 +259,15 @@ class _TapeCapture:
         it, which makes a segment unreadable on its own; a rotated tape
         should be a tape.
 
+        The status a header states is the one the market had when this
+        segment's coverage BEGAN, not the one it has now. A segment that
+        opened while the market was trading and saw it close carries
+        ``open`` in its header and the observed ``closed`` row in its
+        body, in that order, which is what a reader replaying that
+        segment forward should see. The next segment then opens with
+        ``closed``. Status rows observed during the capture stay in the
+        body for exactly this reason: they are events, not headers.
+
         Those rows are then dated to the earliest event in the segment,
         rather than to the moment the daemon asked the venue what the
         market was. A tape is sorted by ``(ts, seq)``, and a venue's own
@@ -191,7 +284,7 @@ class _TapeCapture:
         order, events sharing a timestamp still replay in the order they
         were seen.
         """
-        body = [e for e in observed if not isinstance(e, (Market, MarketStatus))]
+        body = [e for e in observed if not isinstance(e, Market)]
         earliest: dict[str, datetime] = {}
         for event in body:
             current = earliest.get(event.market_id)
@@ -219,9 +312,14 @@ class _TapeCapture:
                     ts=ts,
                     market_id=market_id,
                     source=self._source_tag,
-                    status=described.status,
+                    status=self._segment_status.get(market_id, described.status),
                 )
             )
+        # Whatever the markets are now is what the NEXT segment opens
+        # with, so this is advanced once the segment it describes has
+        # been built and never while events are still being buffered.
+        for market_id, described in self._descriptions.items():
+            self._segment_status[market_id] = described.status
         return [replace(event, seq=i) for i, event in enumerate(headers + body)]
 
     def _flush(self) -> None:
@@ -286,6 +384,7 @@ class CaptureDaemon(_TapeCapture):
             self._open_markets()
             started = self._monotonic()
             last_rotation = started
+            last_status_check = started
             consecutive_failures = 0
 
             while not self._stopping:
@@ -314,6 +413,16 @@ class CaptureDaemon(_TapeCapture):
                     consecutive_failures = 0
 
                 now = self._monotonic()
+                # Before rotation, so a status change observed in this
+                # pass lands in the segment whose coverage contains it
+                # rather than opening the next one.
+                if (
+                    self.config.status_every is not None
+                    and now - last_status_check >= self.config.status_every
+                ):
+                    self._recheck_status(self.source.describe, self._now())
+                    last_status_check = now
+
                 if self.config.rotate_after and now - last_rotation >= self.config.rotate_after:
                     self._flush()
                     last_rotation = now
@@ -346,8 +455,7 @@ class CaptureDaemon(_TapeCapture):
         for market_id in self.config.markets:
             described = self.source.describe(market_id)
             self._canonical[market_id] = described.market_id
-            self._descriptions[described.market_id] = described
-            self._log(f"tracking {described.market_id} ({described.status}): {described.title}")
+            self._track(described, market_id)
 
     def _poll_once(self) -> list[str]:
         """Poll every market once. Returns the errors, one per failed market."""
@@ -428,6 +536,11 @@ class StreamConfig:
     #: capture gives up.
     max_reconnects: int = 5
     reconnect_backoff: float = 1.0
+    #: Seconds between lifecycle re-reads, or None to ask only once at
+    #: the start. A change stream carries book and trade messages, not
+    #: the market's lifecycle, so this stays a REST question even on a
+    #: streamed capture.
+    status_every: float | None = 30.0
 
 
 @dataclass(slots=True)
@@ -467,6 +580,7 @@ class StreamDaemon(_TapeCapture):
         config: StreamConfig,
         *,
         connect: Connector = ws_connect,
+        now: Callable[[], datetime] = lambda: datetime.now(UTC),
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
         log: Callable[[str], None] | None = None,
@@ -483,8 +597,10 @@ class StreamDaemon(_TapeCapture):
         self.source = source
         self.config = config
         self._connect = connect
+        self._now = now
         self._monotonic = monotonic
         self._sleep = sleep
+        self._last_status_check = monotonic()
         self._mirror = BookMirror()
         self._deduper = TradeDeduper()
         self._canonical: dict[str, str] = {}
@@ -499,6 +615,7 @@ class StreamDaemon(_TapeCapture):
             self._open_markets()
             started = self._monotonic()
             last_rotation = started
+            self._last_status_check = started
             attempts = 0
 
             while not self._stopping and not self._expired(started):
@@ -547,8 +664,7 @@ class StreamDaemon(_TapeCapture):
         for market_id in self.config.markets:
             described = self.source.describe(market_id)
             self._canonical[market_id] = described.market_id
-            self._descriptions[described.market_id] = described
-            self._log(f"tracking {described.market_id} ({described.status}): {described.title}")
+            self._track(described, market_id)
 
     def _open_connection(self) -> WebSocketConnection:
         url = self.source.stream_url()
@@ -573,6 +689,17 @@ class StreamDaemon(_TapeCapture):
                 self.stats.messages += 1
                 self._handle(message)
             now = self._monotonic()
+            # The read above returns after at most ``poll_wait``
+            # whether or not a message arrived, which is what makes a
+            # lifecycle check possible on a market so quiet that the
+            # stream says nothing. A market that halts is exactly that
+            # kind of market.
+            if (
+                self.config.status_every is not None
+                and now - self._last_status_check >= self.config.status_every
+            ):
+                self._recheck_status(self.source.describe, self._now())
+                self._last_status_check = now
             if self.config.rotate_after and now - last_rotation >= self.config.rotate_after:
                 self._flush()
                 last_rotation = now

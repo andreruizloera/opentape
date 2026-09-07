@@ -27,7 +27,7 @@ fi
 
 rm -f "$OUT"
 run uv run opentape capture --venue "$VENUE" --market "$MARKET" \
-    -o "$OUT" --poll 2s --duration "$DURATION"
+    -o "$OUT" --poll 2s --duration "$DURATION" --status-every 10s
 run uv run opentape inspect "$OUT"
 run uv run opentape replay "$OUT" --limit 10
 run uv run opentape book "$OUT" --depth 5
@@ -42,7 +42,7 @@ if [ "$VENUE" = "polymarket" ]; then
     echo
     echo "== the same market over the venue's websocket =="
     run uv run opentape capture --venue "$VENUE" --transport websocket \
-        --market "$MARKET" -o "$WS_OUT" --duration "$DURATION"
+        --market "$MARKET" -o "$WS_OUT" --duration "$DURATION" --status-every 10s
     run uv run opentape inspect "$WS_OUT"
     run uv run opentape replay "$WS_OUT" --limit 10
 fi

@@ -182,21 +182,34 @@ class FakeSource(LiveSource):
         *,
         market_id: str = "M1",
         status: str = "open",
+        statuses: list[str | Exception] | None = None,
     ) -> None:
         self.books = books
         self.trade_pages = trades or []
         self.market_id = market_id
         self.status = status
+        #: One answer per describe() call, the last one repeating. None
+        #: means every call answers ``status``.
+        self.statuses = statuses
         self.book_calls = 0
         self.trade_calls = 0
+        self.describe_calls = 0
+        self.described: list[str] = []
 
     def list_markets(self, *, limit: int, search: str | None = None) -> list[MarketRef]:
         return [MarketRef(market_id=self.market_id, title="Fake")]
 
     def describe(self, market_id: str) -> MarketDescription:
-        return MarketDescription(
-            market_id=self.market_id, title="A fake market", status=self.status
-        )
+        index = self.describe_calls
+        self.describe_calls += 1
+        self.described.append(market_id)
+        status = self.status
+        if self.statuses:
+            answer = self.statuses[min(index, len(self.statuses) - 1)]
+            if isinstance(answer, Exception):
+                raise answer
+            status = answer
+        return MarketDescription(market_id=self.market_id, title="A fake market", status=status)
 
     def book(self, market_id: str) -> BookQuote:
         result = self.books[min(self.book_calls, len(self.books) - 1)]
@@ -491,3 +504,176 @@ def test_a_capture_that_observed_nothing_writes_no_tape(tmp_path: Path) -> None:
     with pytest.raises(LiveError):
         run(source, tmp_path, poll_interval=1.0, duration=100.0, max_consecutive_failures=2)
     assert not (tmp_path / "out.parquet").exists()
+
+
+# -- lifecycle status while capturing -------------------------------------
+
+
+def _statuses(path: Path) -> list[tuple[int, str]]:
+    """Every market_status row on a tape, in replay order."""
+    return [
+        (e.seq, e.status)
+        for e in Tape.read(path).replay(speed="max")
+        if isinstance(e, MarketStatus)
+    ]
+
+
+def test_a_market_that_closes_mid_capture_gets_a_status_row_when_it_happens(
+    tmp_path: Path,
+) -> None:
+    # The tape used to carry only the status the capture opened with,
+    # so a market that closed halfway through read as open forever.
+    source = FakeSource(
+        [quote({0.6: float(i)}, {}) for i in range(1, 8)],
+        statuses=["open", "open", "closed"],
+    )
+    daemon, logs = run(source, tmp_path, poll_interval=1.0, duration=6.0, status_every=2.0)
+
+    assert daemon.stats.status_changes == 1
+    assert _statuses(daemon.stats.files[0]) == [(1, "open"), (7, "closed")]
+    assert "M1 changed status: open -> closed" in logs
+
+
+def test_the_closing_row_carries_the_time_the_change_was_observed(tmp_path: Path) -> None:
+    source = FakeSource(
+        [quote({0.6: float(i)}, {}) for i in range(1, 8)],
+        statuses=["open", "open", "closed"],
+    )
+    daemon, _ = run(source, tmp_path, poll_interval=1.0, duration=6.0, status_every=2.0)
+
+    rows = list(Tape.read(daemon.stats.files[0]).replay(speed="max"))
+    change = next(e for e in rows if isinstance(e, MarketStatus) and e.status == "closed")
+    # The opening read answers "open", the check at +2s answers "open"
+    # again, and the one at +4s is the first to see the close. The row
+    # is stamped when it was OBSERVED, which is +4s, not when the venue
+    # closed the market: a poller cannot know that and must not guess.
+    assert change.ts == START + timedelta(seconds=4)
+
+
+def test_an_unchanged_status_writes_no_extra_rows(tmp_path: Path) -> None:
+    # A long capture of a market that never moves should not accumulate
+    # a status row per check saying the same thing.
+    source = FakeSource([quote({0.6: float(i)}, {}) for i in range(1, 12)])
+    daemon, _ = run(source, tmp_path, poll_interval=1.0, duration=10.0, status_every=1.0)
+
+    assert source.describe_calls > 5
+    assert daemon.stats.status_changes == 0
+    assert _statuses(daemon.stats.files[0]) == [(1, "open")]
+
+
+def test_a_reopened_market_records_both_transitions(tmp_path: Path) -> None:
+    # A halt is not a terminal state, so the tape has to be able to say
+    # the market came back.
+    source = FakeSource(
+        [quote({0.6: float(i)}, {}) for i in range(1, 12)],
+        statuses=["open", "halted", "open"],
+    )
+    daemon, _ = run(source, tmp_path, poll_interval=1.0, duration=8.0, status_every=1.0)
+
+    assert daemon.stats.status_changes == 2
+    assert [s for _, s in _statuses(daemon.stats.files[0])] == ["open", "halted", "open"]
+
+
+def test_status_checks_are_paced_independently_of_polls(tmp_path: Path) -> None:
+    # describe() is a second endpoint per market, so a two-second poll
+    # loop must not turn into two requests every two seconds.
+    source = FakeSource([quote({0.6: float(i)}, {}) for i in range(1, 30)])
+    run(source, tmp_path, poll_interval=1.0, duration=20.0, status_every=10.0)
+
+    assert source.book_calls == 20
+    # Twenty book requests against one opening read plus a single check
+    # at +10s. The run ends at +20s before another check comes due.
+    assert source.describe_calls == 2
+
+
+def test_no_status_check_asks_exactly_once(tmp_path: Path) -> None:
+    source = FakeSource(
+        [quote({0.6: float(i)}, {}) for i in range(1, 30)],
+        statuses=["open", "closed"],
+    )
+    daemon, _ = run(source, tmp_path, poll_interval=1.0, duration=20.0, status_every=None)
+
+    assert source.describe_calls == 1
+    assert daemon.stats.status_changes == 0
+    assert _statuses(daemon.stats.files[0]) == [(1, "open")]
+
+
+def test_a_failed_status_check_is_counted_and_does_not_end_the_capture(
+    tmp_path: Path,
+) -> None:
+    # The lifecycle endpoint is not the book endpoint. Losing it should
+    # not throw away book and trade data that is arriving fine.
+    source = FakeSource(
+        [quote({0.6: float(i)}, {}) for i in range(1, 12)],
+        statuses=["open", LiveError("status endpoint 503"), LiveError("status endpoint 503")],
+    )
+    daemon, logs = run(source, tmp_path, poll_interval=1.0, duration=6.0, status_every=2.0)
+
+    assert daemon.stats.status_check_failures == 2
+    assert daemon.stats.status_changes == 0
+    assert daemon.stats.polls == 6
+    assert _statuses(daemon.stats.files[0]) == [(1, "open")]
+    assert any("status check failed for M1: status endpoint 503" in line for line in logs)
+
+
+def test_a_failed_status_check_does_not_overwrite_the_held_status(tmp_path: Path) -> None:
+    # An unknown status is not a change. Writing one down because a
+    # request timed out would put a claim on the tape that nothing
+    # observed.
+    source = FakeSource(
+        [quote({0.6: float(i)}, {}) for i in range(1, 12)],
+        statuses=["open", "closed", LiveError("gone"), LiveError("gone")],
+    )
+    daemon, _ = run(source, tmp_path, poll_interval=1.0, duration=8.0, status_every=2.0)
+
+    assert [s for _, s in _statuses(daemon.stats.files[0])] == ["open", "closed"]
+    assert daemon.stats.status_check_failures == 2
+
+
+def test_the_segment_after_a_close_opens_with_the_new_status(tmp_path: Path) -> None:
+    # A rotated segment must be readable on its own, which means its
+    # header states what the market was for THAT segment, not what it
+    # was when the capture started.
+    source = FakeSource(
+        [quote({0.6: float(i)}, {}) for i in range(1, 20)],
+        statuses=["open", "open", "closed"],
+    )
+    daemon, _ = run(
+        source, tmp_path, poll_interval=1.0, duration=8.0, rotate_after=2.0, status_every=2.0
+    )
+
+    assert len(daemon.stats.files) == 4
+    per_file = [[s for _, s in _statuses(p)] for p in daemon.stats.files]
+    # Segment 1 was entirely before the close. Segment 2 contains it, so
+    # it opens with what the market was when that segment began and
+    # carries the transition in its body. Every later segment opens
+    # closed, which is what makes a rotated segment readable alone.
+    assert per_file == [["open"], ["open", "closed"], ["closed"], ["closed"]]
+
+
+def test_the_status_row_in_a_segment_sorts_after_that_segment_header(tmp_path: Path) -> None:
+    source = FakeSource(
+        [quote({0.6: float(i)}, {}) for i in range(1, 20)],
+        statuses=["open", "open", "closed"],
+    )
+    daemon, _ = run(source, tmp_path, poll_interval=1.0, duration=6.0, status_every=2.0)
+
+    events = list(Tape.read(daemon.stats.files[0]).replay(speed="max"))
+    assert isinstance(events[0], Market)
+    assert isinstance(events[1], MarketStatus)
+    assert events[1].status == "open"  # type: ignore[union-attr]
+    seqs = [e.seq for e in events]
+    assert seqs == sorted(seqs)
+
+
+def test_a_status_check_uses_the_id_the_user_typed(tmp_path: Path) -> None:
+    # A venue can accept several spellings and only the user's is known
+    # to resolve, since it is the one that worked at the start.
+    source = FakeSource(
+        [quote({0.6: float(i)}, {}) for i in range(1, 12)],
+        market_id="0xCANONICAL",
+    )
+    run(source, tmp_path, markets=("some-slug",), poll_interval=1.0, duration=4.0, status_every=2.0)
+
+    assert source.describe_calls == 2
+    assert set(source.described) == {"some-slug"}

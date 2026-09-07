@@ -54,6 +54,8 @@ def run(
     rotate_after: float | None = None,
     max_reconnects: int = 0,
     log: list[str] | None = None,
+    status_every: float | None = None,
+    source: PolymarketStream | None = None,
 ) -> Any:
     config = StreamConfig(
         markets=(MARKET,),
@@ -63,8 +65,11 @@ def run(
         poll_wait=0.05,
         max_reconnects=max_reconnects,
         reconnect_backoff=0.01,
+        status_every=status_every,
     )
-    daemon = StreamDaemon(source_for(server), config, log=(log.append if log is not None else None))
+    daemon = StreamDaemon(
+        source or source_for(server), config, log=(log.append if log is not None else None)
+    )
     return daemon.run()
 
 
@@ -207,3 +212,89 @@ def test_a_capture_that_saw_nothing_writes_no_file(tmp_path: Path) -> None:
         stats = run(server, tmp_path)
     assert stats.files == []
     assert not (tmp_path / "tape.parquet").exists()
+
+
+# -- lifecycle status on a streamed capture -------------------------------
+
+
+class ClosingFetcher(FakeFetcher):
+    """A fetcher whose market closes after the first description."""
+
+    def __init__(self, market: Any) -> None:
+        super().__init__(market)
+        self.market_reads = 0
+
+    def __call__(self, url: str, params: dict[str, Any] | None = None) -> Any:
+        if "gamma-api" in url:
+            return [{"conditionId": self.market["condition_id"]}]
+        self.market_reads += 1
+        if self.market_reads > 1:
+            return dict(self.market, closed=True)
+        return self.market
+
+
+def test_a_streamed_capture_records_a_market_that_closes(tmp_path: Path) -> None:
+    # A change stream carries book and trade messages. The venue does
+    # not push "this market closed" down the same socket, so a streamed
+    # tape needs the same periodic REST question a polled one asks.
+    market = json.loads((LIVE_FIXTURES / "polymarket_ws_market.json").read_text())
+    fetcher = ClosingFetcher(market)
+    logs: list[str] = []
+    with StreamReplayServer(recorded()) as server:
+        source = PolymarketStream(PolymarketLive(fetcher), url=server.url)
+        stats = run(server, tmp_path, source=source, status_every=0.01, log=logs)
+
+    assert stats.status_changes >= 1
+    statuses = [
+        e.status
+        for e in Tape.read(tmp_path / "tape.parquet").replay(speed="max")
+        if type(e).__name__ == "MarketStatus"
+    ]
+    assert statuses[0] == "open"
+    assert "closed" in statuses
+    assert any("changed status: open -> closed" in line for line in logs)
+
+
+def test_a_streamed_capture_asks_once_when_status_checks_are_off(tmp_path: Path) -> None:
+    market = json.loads((LIVE_FIXTURES / "polymarket_ws_market.json").read_text())
+    fetcher = ClosingFetcher(market)
+    with StreamReplayServer(recorded()) as server:
+        source = PolymarketStream(PolymarketLive(fetcher), url=server.url)
+        stats = run(server, tmp_path, source=source, status_every=None)
+
+    assert stats.status_changes == 0
+    assert fetcher.market_reads == 1
+    statuses = [
+        e.status
+        for e in Tape.read(tmp_path / "tape.parquet").replay(speed="max")
+        if type(e).__name__ == "MarketStatus"
+    ]
+    assert statuses == ["open"]
+
+
+def test_a_failed_status_check_does_not_end_a_streamed_capture(tmp_path: Path) -> None:
+    class BrokenFetcher(FakeFetcher):
+        def __init__(self, market: Any) -> None:
+            super().__init__(market)
+            self.reads = 0
+
+        def __call__(self, url: str, params: dict[str, Any] | None = None) -> Any:
+            if "gamma-api" in url:
+                return [{"conditionId": self.market["condition_id"]}]
+            self.reads += 1
+            if self.reads > 1:
+                raise LiveError("market endpoint 503")
+            return self.market
+
+    market = json.loads((LIVE_FIXTURES / "polymarket_ws_market.json").read_text())
+    fetcher = BrokenFetcher(market)
+    with StreamReplayServer(recorded()) as server:
+        source = PolymarketStream(PolymarketLive(fetcher), url=server.url)
+        stats = run(server, tmp_path, source=source, status_every=0.01)
+
+    # The socket was fine, so the tape is fine. Only the lifecycle
+    # answer is missing, and the count is how a reader learns that.
+    assert stats.status_check_failures >= 1
+    assert stats.status_changes == 0
+    assert stats.events > 0
+    assert (tmp_path / "tape.parquet").exists()

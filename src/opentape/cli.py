@@ -26,6 +26,7 @@ from opentape.live import (
     HttpFetcher,
     StreamConfig,
     StreamDaemon,
+    TapeStats,
     build_source,
     build_stream_source,
     parse_duration,
@@ -210,6 +211,41 @@ def _cmd_markets(args: argparse.Namespace) -> int:
     return 0
 
 
+def _report_status(stats: TapeStats) -> None:
+    """Print what the lifecycle checks saw, and only when they saw something.
+
+    A failed check is printed even though it is not fatal, because it
+    is the one case where the tape's status rows might be out of date
+    and nothing else in the output would say so.
+    """
+    if stats.status_changes:
+        print(
+            f"{stats.status_changes:,} market status change(s) were observed and "
+            f"written to the tape"
+        )
+    if stats.status_check_failures:
+        print(
+            f"{stats.status_check_failures:,} status check(s) failed; the tape's status "
+            f"rows are as of the last check that succeeded"
+        )
+
+
+def _status_every(args: argparse.Namespace) -> float | None:
+    """Resolve --status-every and --no-status-check into one setting.
+
+    Two flags rather than a magic zero, because "ask every N seconds"
+    and "never ask again" are different intentions and a reader of a
+    command line should not have to know that 0 means never.
+    """
+    if args.no_status_check:
+        if args.status_every:
+            raise OpenTapeError(
+                "--status-every and --no-status-check contradict each other; pass one or the other"
+            )
+        return None
+    return parse_duration(args.status_every or "30s", flag="--status-every")
+
+
 def _cmd_capture(args: argparse.Namespace) -> int:
     if args.transport == "websocket":
         return _cmd_capture_stream(args)
@@ -222,6 +258,7 @@ def _cmd_capture(args: argparse.Namespace) -> int:
         rotate_after=parse_duration(args.rotate, flag="--rotate") if args.rotate else None,
         resnapshot_every=args.snapshot_every,
         backfill=args.backfill,
+        status_every=_status_every(args),
     )
     log = (lambda msg: None) if args.quiet else (lambda msg: print(msg, flush=True))
     if not args.quiet:
@@ -239,6 +276,7 @@ def _cmd_capture(args: argparse.Namespace) -> int:
         + (f", {stats.failed_polls:,} failed polls" if stats.failed_polls else "")
         + ")"
     )
+    _report_status(stats)
     if not stats.files:
         print("no events were captured, so no tape was written")
         return 1
@@ -267,6 +305,7 @@ def _cmd_capture_stream(args: argparse.Namespace) -> int:
         output=Path(args.output),
         duration=parse_duration(args.duration, flag="--duration") if args.duration else None,
         rotate_after=parse_duration(args.rotate, flag="--rotate") if args.rotate else None,
+        status_every=_status_every(args),
     )
     log = (lambda msg: None) if args.quiet else (lambda msg: print(msg, flush=True))
     if not args.quiet:
@@ -286,6 +325,7 @@ def _cmd_capture_stream(args: argparse.Namespace) -> int:
         + ")"
         + checked
     )
+    _report_status(stats)
     if stats.dropped_updates:
         print(
             f"{stats.dropped_updates:,} level update(s) arrived before the first snapshot "
@@ -422,6 +462,20 @@ def build_parser() -> argparse.ArgumentParser:
         "(default 0: the tape holds only trades observed to arrive during the capture). "
         "Backfilled trades carry their venue timestamp, so they sort before the market "
         "definition row that opens the tape",
+    )
+    p_capture.add_argument(
+        "--status-every",
+        default=None,
+        metavar="DURATION",
+        help="re-read each market's lifecycle status this often, so a market that closes "
+        "or halts mid-capture is recorded when it happens (default 30s). Applies to both "
+        "transports: a change stream carries book and trade messages, not lifecycle",
+    )
+    p_capture.add_argument(
+        "--no-status-check",
+        action="store_true",
+        help="read each market's status once at the start and never again. The tape then "
+        "states the status the capture opened with, whatever happened after",
     )
     p_capture.add_argument(
         "--timeout", type=float, default=10.0, help="per-request timeout in seconds"
