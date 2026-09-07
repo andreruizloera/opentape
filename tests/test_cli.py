@@ -265,3 +265,84 @@ def test_an_unknown_venue_is_rejected_by_the_parser(capsys) -> None:
     with pytest.raises(SystemExit):
         main(["markets", "--venue", "nyse"])
     assert "invalid choice" in capsys.readouterr().err
+
+
+# -- capture --transport websocket ----------------------------------------
+
+
+def _ws_args(tmp_path: Path, *extra: str) -> list[str]:
+    return [
+        "capture",
+        "--venue",
+        "polymarket",
+        "--transport",
+        "websocket",
+        "--market",
+        "xi-jinping-out-before-2027",
+        "-o",
+        str(tmp_path / "o.parquet"),
+        *extra,
+    ]
+
+
+def test_a_websocket_capture_of_kalshi_says_why_it_cannot(tmp_path: Path, capsys) -> None:
+    """Kalshi's stream needs an API key, which is a different answer
+    from "not implemented yet" and is worth saying out loud."""
+    code = main(
+        [
+            "capture",
+            "--venue",
+            "kalshi",
+            "--transport",
+            "websocket",
+            "--market",
+            "X",
+            "-o",
+            str(tmp_path / "o.parquet"),
+        ]
+    )
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "requires an API key" in err
+    assert "--transport rest-poll" in err
+    assert "Traceback" not in err
+
+
+@pytest.mark.parametrize(
+    "flag, value, expected",
+    [
+        ("--poll", "1s", "--poll applies to --transport rest-poll only"),
+        ("--snapshot-every", "5", "--snapshot-every applies to --transport rest-poll only"),
+        ("--backfill", "5", "--backfill applies to --transport rest-poll only"),
+    ],
+)
+def test_polling_only_flags_are_refused_for_a_websocket_capture(
+    tmp_path: Path, capsys, flag: str, value: str, expected: str
+) -> None:
+    assert main(_ws_args(tmp_path, flag, value)) == 1
+    err = capsys.readouterr().err
+    assert expected in err
+    assert "Traceback" not in err
+
+
+def test_the_default_transport_is_still_polling(offline: FakeFetcher, tmp_path: Path) -> None:
+    """The flag is additive: a command written before it behaves the same."""
+    out = tmp_path / "live.parquet"
+    assert (
+        main(
+            [
+                "capture",
+                "--venue",
+                "polymarket",
+                "--market",
+                "xi-jinping-out-before-2027",
+                "-o",
+                str(out),
+                "--duration",
+                "3ms",
+                "--quiet",
+            ]
+        )
+        == 0
+    )
+    assert "polymarket-rest-poll" in set(Tape.read(out).frame["source"].to_list())

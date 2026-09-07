@@ -75,10 +75,12 @@ $ opentape replay examples/sample.parquet --limit 10
 
 ## Recording a live venue
 
-`opentape capture` polls a venue's public endpoints and writes the
+`opentape capture` reads a venue's public market data and writes the
 same canonical tapes. Only unauthenticated endpoints are used, so
-there is nothing to sign up for and no key to set. Find a market, then
-record it:
+there is nothing to sign up for and no key to set. There are two
+transports: `--transport rest-poll`, the default, samples the book on
+an interval, and `--transport websocket` subscribes to the venue's own
+change stream. Find a market, then record it:
 
 ```
 $ opentape markets --venue polymarket --limit 3
@@ -171,10 +173,84 @@ shape: (2, 5)
 `./demo_live.sh` runs that whole sequence against a market it picks
 itself. It is the one script here that needs the network.
 
+### Streaming instead of polling
+
+`--transport websocket` subscribes to the venue's change stream, so a
+`book_delta` in the tape is a change the venue published rather than a
+difference between two samples. A real three-minute run on 2026-09-07:
+
+```
+$ opentape capture --venue polymarket --transport websocket \
+      --market lol-ig1-lgd-2026-09-08 -o ig.parquet --duration 3m
+streaming 1 market(s) from polymarket for 3m
+connecting to wss://ws-subscriptions-clob.polymarket.com/ws/market; press Ctrl-C to stop and write the tape
+tracking lol-ig1-lgd-2026-09-08 (open): LoL: Invictus Gaming vs LGD Gaming (BO5) - LPL Playoffs
+subscribed to 1 market(s) on wss://ws-subscriptions-clob.polymarket.com/ws/market
+wrote ig.parquet: 24 events
+captured 24 events from 24 messages (3 snapshots, 17 deltas, 2 trades), 2 snapshot check(s) with 0 divergence(s)
+
+$ opentape replay ig.parquet --limit 8
+[2026-09-07T13:23:46.633Z] seq=     0 MARKET      lol-ig1-lgd-2026-09-08 "LoL: Invictus Gaming vs LGD Gaming (BO5) - LPL Playoffs"
+[2026-09-07T13:23:46.633Z] seq=     1 STATUS      lol-ig1-lgd-2026-09-08 open
+[2026-09-07T13:23:46.633Z] seq=     2 SNAPSHOT    lol-ig1-lgd-2026-09-08 22x21 levels, best 0.63/0.64
+[2026-09-07T13:24:47.175Z] seq=     3 BOOK_DELTA  lol-ig1-lgd-2026-09-08 ask  0.64 set 82495.8
+[2026-09-07T13:24:47.175Z] seq=     4 SNAPSHOT    lol-ig1-lgd-2026-09-08 22x21 levels, best 0.63/0.64
+[2026-09-07T13:24:47.247Z] seq=     5 TRADE       lol-ig1-lgd-2026-09-08 YES  buy  0.64 x 122.703
+[2026-09-07T13:24:52.376Z] seq=     6 BOOK_DELTA  lol-ig1-lgd-2026-09-08 ask  0.64 set 82490.8
+[2026-09-07T13:24:52.376Z] seq=     7 BOOK_DELTA  lol-ig1-lgd-2026-09-08 bid  0.62 set 35125.8
+```
+
+The `source` column reads `polymarket-ws` rather than
+`polymarket-rest-poll`, so the transport travels with the data.
+
+**The "snapshot check" line is the part worth explaining.** A streamed
+tape is only useful if its deltas are enough to rebuild the book, and
+that is a claim which can quietly stop being true. Polymarket publishes
+full books periodically as well as every level change, so opentape
+keeps its own book from the changes and compares it against each
+published snapshot. Two comparisons happened in the run above and both
+agreed. A disagreement is counted, named on stderr with the levels that
+differ, and the venue's snapshot wins.
+
+That check is also how the transport's one load-bearing assumption was
+settled. A `price_change` carries a `size`, and reading it as the
+level's new total rather than as an amount to add is the difference
+between a correct book and a garbage one. Rather than trust the
+documentation, a recorded session was replayed both ways and each
+reconstruction compared against the venue's next published snapshot:
+the absolute reading reproduced it exactly on both outcome tokens
+across thirteen changes each, and the additive reading matched neither.
+That recording is committed as `tests/fixtures/live/polymarket_ws.jsonl`
+and the comparison runs offline on every push.
+
+### What a streamed tape does and does not claim
+
+- **Polymarket only.** Kalshi's websocket answers HTTP 401 to an
+  unauthenticated upgrade, so it needs an API key and is not
+  implemented; `--transport websocket --venue kalshi` says exactly that
+  and points at `rest-poll`.
+- **A dropped connection is a gap.** On reconnect every mirrored book is
+  discarded and nothing is written for a market until the venue sends a
+  fresh snapshot, because an unknown number of changes were missed and
+  deltas across that hole would describe a book that never existed. The
+  same rule as a failed poll, for the same reason.
+- **A level change that arrives before any snapshot is dropped**, and
+  the count is reported. Applying it to an empty book would produce a
+  file that looks like a book and is missing every level nobody happened
+  to touch.
+- **Book timestamps are the venue's**, and a book's timestamp is when it
+  last changed, not when it was sent. A quiet market's opening snapshot
+  can therefore be minutes older than the capture that received it.
+- **Fills carry no per-fill id.** The dedupe key is the transaction hash
+  plus the fill's YES-terms price, size, and side, which also folds
+  together the two publications of one fill if the venue ever sends it
+  against both outcome tokens. In the sessions recorded so far each fill
+  was published once, against the token it executed on.
+
 ### What a polled tape does and does not claim
 
-Capture goes over REST polling, not a websocket, and the difference is
-recorded rather than glossed over.
+The default transport is REST polling, and the difference is recorded
+rather than glossed over.
 
 - **A poll interval is a sampling rate.** A level that appears and
   disappears between two polls is not in the tape, and a `book_delta`
@@ -307,11 +383,16 @@ opentape markets --venue kalshi --search bitcoin
 opentape capture --venue kalshi --market TICKER -o tape.parquet --duration 10m
 opentape capture --venue polymarket --market SLUG -o tape.parquet \
     --poll 1s --rotate 5m          # numbered segments, each a valid tape
+opentape capture --venue polymarket --market SLUG -o tape.parquet \
+    --transport websocket --duration 10m    # the venue's change stream
 ```
 
 `capture` runs until `--duration` elapses, or until Ctrl-C, which
-stops after the current poll and writes what it has rather than
-discarding it. `--rotate` writes `tape-0001.parquet`,
+stops after the current poll or message and writes what it has rather
+than discarding it. `--poll`, `--snapshot-every`, and `--backfill`
+belong to `rest-poll` and are refused with a reason under
+`--transport websocket`, where the venue sets the pace and publishes
+its own snapshots. `--rotate` writes `tape-0001.parquet`,
 `tape-0002.parquet`, and so on; every segment repeats the market
 definition rows for the markets in it, so a segment is readable on its
 own.
@@ -376,20 +457,34 @@ src/opentape/
     kalshi_style.py       Kalshi-style JSON
     polymarket_style.py   Polymarket-style JSON
   live/
-    http.py               the only module that opens a socket; injectable
+    http.py               the only module that opens an HTTP socket; injectable
+    ws.py                 the only module that opens a websocket; a small RFC 6455 client
     base.py               LiveSource, plus BookTracker and TradeDeduper
+    stream.py             StreamSource and BookMirror: the push-shaped seam
     kalshi.py             Kalshi public REST
     polymarket.py         Polymarket public REST
-    daemon.py             the poll loop, rotation, gap handling
+    polymarket_stream.py  Polymarket public websocket
+    daemon.py             both loops, rotation, gap handling, tape writing
 ```
 
 Live capture keeps the same split the rest of the library uses. All
-network I/O is behind one `Fetcher` callable, so the venue sources are
-pure functions of the JSON they are handed and the whole test suite
-runs offline against recorded payloads (`tests/fixtures/live/`).
-Turning repeated full books into snapshots and deltas is shared in
-`BookTracker` rather than repeated per venue, so a new venue only has
-to answer what a market is, what its book is, and what has traded.
+network I/O is behind one `Fetcher` callable or one websocket the
+daemon owns, so the venue sources are pure functions of the JSON or
+text they are handed and the whole test suite runs offline against
+recorded payloads (`tests/fixtures/live/`). Turning repeated full books
+into snapshots and deltas is shared in `BookTracker` rather than
+repeated per venue, so a new REST venue only has to answer what a
+market is, what its book is, and what has traded. A streaming venue
+implements four methods instead, of which only `parse()` carries any
+venue detail: text in, canonical updates out, no clock and no socket.
+
+The two transports differ only in how events are produced. Buffering,
+segment headers, rotation, sequence numbering, and writing are shared,
+which is what makes a streamed tape and a polled tape the same kind of
+file. The offline tests run the real websocket client against a real
+loopback server replaying recorded frames, so the handshake, the
+masking, the frame parsing, and the fragment reassembly all execute on
+every push rather than only during a live capture.
 
 A tape is one flat Parquet table: every event is a row, unused columns
 are null, and `(ts, seq)` defines the total order. SCHEMA.md explains
@@ -405,12 +500,16 @@ windows with heavier trading, and two resolutions.
 
 ## Limitations
 
-- Live capture polls REST; there is no websocket transport, so a tape
-  samples the book rather than subscribing to it. See "What a polled
-  tape does and does not claim" above for what that costs.
+- The websocket transport covers Polymarket only. Kalshi's stream
+  requires an API key, so capturing it still means REST polling, where a
+  tape samples the book rather than subscribing to it. See "What a
+  polled tape does and does not claim" above for what that costs.
 - Only the two venues' unauthenticated endpoints are supported. Nothing
   here reads private order state, and no venue that requires a key is
   implemented.
+- A streamed capture reconnects after a dropped connection, but what was
+  missed while it was disconnected is gone. The tape re-snapshots rather
+  than guessing, so the gap is visible, not filled.
 - A market's status is read once when the capture starts. A market that
   closes mid-capture keeps its opening status on that tape.
 - Polymarket's public trades endpoint publishes no per-fill id, so
@@ -428,8 +527,8 @@ windows with heavier trading, and two resolutions.
 
 ## Roadmap
 
-See ROADMAP.md. Highlights: websocket transports for both venues,
-authenticated feeds, tape slicing and merging, multi-file datasets,
+See ROADMAP.md. Highlights: authenticated feeds (which is what a
+Kalshi stream needs), tape slicing and merging, multi-file datasets,
 and a PyPI release.
 
 ## Contributing

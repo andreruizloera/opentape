@@ -32,3 +32,12 @@ jobs:
           uv run opentape book examples/sample.parquet --market OT-FEDCUT-SEP26 --depth 3
           uv run opentape capture --help
           uv run opentape markets --help
+          # A websocket capture of Kalshi must fail cleanly, naming the
+          # reason, rather than opening a socket to find out.
+          if uv run opentape capture --venue kalshi --transport websocket \
+                 --market X -o /tmp/no.parquet > /tmp/refusal.txt 2>&1; then
+            echo "expected a nonzero exit for a kalshi websocket capture" >&2
+            exit 1
+          fi
+          grep -q 'requires an API key' /tmp/refusal.txt
+          grep -q 'transport rest-poll' /tmp/refusal.txt

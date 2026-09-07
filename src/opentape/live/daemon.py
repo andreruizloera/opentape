@@ -45,6 +45,15 @@ from opentape.events import (
     Trade,
 )
 from opentape.live.base import BookTracker, LiveSource, MarketDescription, TradeDeduper
+from opentape.live.stream import (
+    BookMirror,
+    StreamBook,
+    StreamLevel,
+    StreamSource,
+    StreamTrade,
+)
+from opentape.live.ws import Connector, WebSocketConnection
+from opentape.live.ws import connect as ws_connect
 from opentape.tape import Tape
 
 _DURATION_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*(ms|s|m|h)?\s*$", re.IGNORECASE)
@@ -85,11 +94,9 @@ class CaptureConfig:
 
 
 @dataclass(slots=True)
-class CaptureStats:
-    """What a finished capture did."""
+class TapeStats:
+    """The part of a capture's result that does not depend on transport."""
 
-    polls: int = 0
-    failed_polls: int = 0
     events: int = 0
     trades: int = 0
     snapshots: int = 0
@@ -97,7 +104,146 @@ class CaptureStats:
     files: list[Path] = field(default_factory=list)
 
 
-class CaptureDaemon:
+@dataclass(slots=True)
+class CaptureStats(TapeStats):
+    """What a finished polling capture did."""
+
+    polls: int = 0
+    failed_polls: int = 0
+
+
+class _TapeCapture:
+    """Everything a capture does with events once it has them.
+
+    Buffering, segment headers, rotation, sequence numbering, and
+    writing are identical whether the events came from polling REST or
+    from a venue's websocket, so they live here and each transport's
+    daemon subclasses this with its own loop. Splitting it this way is
+    what keeps a streamed tape and a polled tape the same kind of file.
+    """
+
+    def __init__(
+        self,
+        *,
+        output: Path,
+        rotate_after: float | None,
+        source_tag: str,
+        stats: TapeStats,
+        log: Callable[[str], None] | None = None,
+    ) -> None:
+        self._output = output
+        self._rotate_after = rotate_after
+        self._source_tag = source_tag
+        self._log = log or (lambda _msg: None)
+        self._buffer: list[Event] = []
+        self._segment = 0
+        self._stopping = False
+        self._descriptions: dict[str, MarketDescription] = {}
+        self.stats = stats
+
+    def stop(self) -> None:
+        """Ask the loop to finish what it is doing and flush."""
+        self._stopping = True
+
+    def _emit(self, event: Event) -> None:
+        """Buffer an observed event, in the order it was observed."""
+        self._buffer.append(event)
+        if isinstance(event, Trade):
+            self.stats.trades += 1
+        elif isinstance(event, OrderBookSnapshot):
+            self.stats.snapshots += 1
+        elif isinstance(event, BookDelta):
+            self.stats.deltas += 1
+
+    # -- output ------------------------------------------------------------
+
+    def _segment_path(self) -> Path:
+        out = self._output
+        if not self._rotate_after:
+            return out
+        self._segment += 1
+        return out.with_name(f"{out.stem}-{self._segment:04d}{out.suffix or '.parquet'}")
+
+    def _prepare_segment(self, observed: list[Event]) -> list[Event]:
+        """Turn a buffer of observed events into a self-contained tape.
+
+        Two things happen here that cannot be done while capturing.
+
+        Each segment gets its own market definition and status rows.
+        Emitting them once at the start of the capture would leave every
+        rotated file after the first with no title for the markets in
+        it, which makes a segment unreadable on its own; a rotated tape
+        should be a tape.
+
+        Those rows are then dated to the earliest event in the segment,
+        rather than to the moment the daemon asked the venue what the
+        market was. A tape is sorted by ``(ts, seq)``, and a venue's own
+        book timestamp can be older than the local clock reading that
+        follows it, so a header dated to capture time can sort after the
+        book it describes. Dating the header to the start of the
+        segment's own coverage is not a claim about when the market came
+        into existence; it is the statement that for the whole of this
+        tape, this is what the market was.
+
+        Sequence numbers are then assigned in that final order. Each
+        segment is its own tape, so its numbering starts at zero, and
+        because the renumbering is a stable pass over the observed
+        order, events sharing a timestamp still replay in the order they
+        were seen.
+        """
+        body = [e for e in observed if not isinstance(e, (Market, MarketStatus))]
+        earliest: dict[str, datetime] = {}
+        for event in body:
+            current = earliest.get(event.market_id)
+            if current is None or event.ts < current:
+                earliest[event.market_id] = event.ts
+
+        headers: list[Event] = []
+        for market_id, described in self._descriptions.items():
+            if market_id not in earliest:
+                continue
+            ts = earliest[market_id]
+            headers.append(
+                Market(
+                    seq=0,
+                    ts=ts,
+                    market_id=market_id,
+                    source=self._source_tag,
+                    title=described.title,
+                    outcomes=described.outcomes,
+                )
+            )
+            headers.append(
+                MarketStatus(
+                    seq=0,
+                    ts=ts,
+                    market_id=market_id,
+                    source=self._source_tag,
+                    status=described.status,
+                )
+            )
+        return [replace(event, seq=i) for i, event in enumerate(headers + body)]
+
+    def _flush(self) -> None:
+        """Write the buffered events to a tape file and clear the buffer.
+
+        A rotation with nothing observed writes no file: an empty tape
+        is a valid tape but a directory of them says nothing, and a
+        quiet market should not manufacture files.
+        """
+        events = self._prepare_segment(self._buffer)
+        self._buffer = []
+        if not events:
+            return
+        path = self._segment_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        Tape.from_events(events).write(path)
+        self.stats.files.append(path)
+        self.stats.events += len(events)
+        self._log(f"wrote {path}: {len(events):,} events")
+
+
+class CaptureDaemon(_TapeCapture):
     """Poll a :class:`LiveSource` on an interval and write tapes."""
 
     def __init__(
@@ -112,28 +258,25 @@ class CaptureDaemon:
     ) -> None:
         if not config.markets:
             raise OpenTapeError("capture needs at least one market")
+        super().__init__(
+            output=config.output,
+            rotate_after=config.rotate_after,
+            source_tag=source.source_tag,
+            stats=CaptureStats(),
+            log=log,
+        )
         self.source = source
         self.config = config
         self._now = now
         self._monotonic = monotonic
         self._sleep = sleep
-        self._log = log or (lambda _msg: None)
         self._tracker = BookTracker(resnapshot_every=config.resnapshot_every)
         self._deduper = TradeDeduper()
-        self._buffer: list[Event] = []
-        self._segment = 0
-        self._stopping = False
         self._resnapshot: set[str] = set()
         self._canonical: dict[str, str] = {}
         self._polled: set[str] = set()
-        self._descriptions: dict[str, MarketDescription] = {}
-        self.stats = CaptureStats()
-
-    # -- control -----------------------------------------------------------
-
-    def stop(self) -> None:
-        """Ask the loop to finish the current poll and flush."""
-        self._stopping = True
+        #: Narrowed from the base class's :class:`TapeStats` for readers.
+        self.stats: CaptureStats = CaptureStats()
 
     # -- main loop ---------------------------------------------------------
 
@@ -267,102 +410,216 @@ class CaptureDaemon:
                 )
             )
 
-    def _emit(self, event: Event) -> None:
-        """Buffer an observed event, in the order it was observed."""
-        self._buffer.append(event)
-        if isinstance(event, Trade):
-            self.stats.trades += 1
-        elif isinstance(event, OrderBookSnapshot):
-            self.stats.snapshots += 1
-        elif isinstance(event, BookDelta):
-            self.stats.deltas += 1
 
-    # -- output ------------------------------------------------------------
+@dataclass(frozen=True, slots=True)
+class StreamConfig:
+    """Everything the streaming daemon needs that is not the venue."""
 
-    def _segment_path(self) -> Path:
-        out = self.config.output
-        if not self.config.rotate_after:
-            return out
-        self._segment += 1
-        return out.with_name(f"{out.stem}-{self._segment:04d}{out.suffix or '.parquet'}")
+    markets: tuple[str, ...]
+    output: Path
+    duration: float | None = None
+    rotate_after: float | None = None
+    #: How long a single read waits before the loop does its periodic
+    #: work. This is not a timeout in the failure sense: a quiet market
+    #: publishes nothing for minutes and that is not an error. It only
+    #: bounds how long a rotation or a stop can be delayed by silence.
+    poll_wait: float = 1.0
+    #: How many times a dropped connection is re-established before the
+    #: capture gives up.
+    max_reconnects: int = 5
+    reconnect_backoff: float = 1.0
 
-    def _prepare_segment(self, observed: list[Event]) -> list[Event]:
-        """Turn a buffer of observed events into a self-contained tape.
 
-        Two things happen here that cannot be done while polling.
+@dataclass(slots=True)
+class StreamStats(TapeStats):
+    """What a finished streaming capture did."""
 
-        Each segment gets its own market definition and status rows.
-        Emitting them once at the start of the capture would leave every
-        rotated file after the first with no title for the markets in
-        it, which makes a segment unreadable on its own; a rotated tape
-        should be a tape.
+    messages: int = 0
+    reconnects: int = 0
+    #: Venue snapshots that were compared against the mirrored book.
+    checks: int = 0
+    #: Comparisons where the mirrored book did not match the venue's.
+    divergences: int = 0
+    #: Level changes discarded because no snapshot had arrived yet for
+    #: that market, so there was no book to apply them to.
+    dropped_updates: int = 0
 
-        Those rows are then dated to the earliest event in the segment,
-        rather than to the moment the daemon asked the venue what the
-        market was. A tape is sorted by ``(ts, seq)``, and a venue's own
-        book timestamp can be older than the local clock reading that
-        follows it, so a header dated to capture time can sort after the
-        book it describes. Dating the header to the start of the
-        segment's own coverage is not a claim about when the market came
-        into existence; it is the statement that for the whole of this
-        tape, this is what the market was.
 
-        Sequence numbers are then assigned in that final order. Each
-        segment is its own tape, so its numbering starts at zero, and
-        because the renumbering is a stable pass over the observed
-        order, events sharing a timestamp still replay in the order they
-        were seen.
-        """
-        body = [e for e in observed if not isinstance(e, (Market, MarketStatus))]
-        earliest: dict[str, datetime] = {}
-        for event in body:
-            current = earliest.get(event.market_id)
-            if current is None or event.ts < current:
-                earliest[event.market_id] = event.ts
+class StreamDaemon(_TapeCapture):
+    """Subscribe to a :class:`StreamSource` and write tapes.
 
-        headers: list[Event] = []
-        for market_id, described in self._descriptions.items():
-            if market_id not in earliest:
-                continue
-            ts = earliest[market_id]
-            headers.append(
-                Market(
-                    seq=0,
-                    ts=ts,
-                    market_id=market_id,
-                    source=self.source.source_tag,
-                    title=described.title,
-                    outcomes=described.outcomes,
+    The loop is smaller than the polling one because the venue does the
+    work the poller was doing: there is no interval, no diffing of
+    consecutive books, and no backfill question, since every event on a
+    stream was published while the capture was connected.
+
+    What replaces them is connection management, and its rule is the
+    streaming version of "a failed poll is a gap". A dropped connection
+    means an unknown number of changes were missed, so every mirrored
+    book is discarded on reconnect and nothing is written for a market
+    until the venue sends a fresh snapshot. Emitting deltas across that
+    hole would produce a book that never existed.
+    """
+
+    def __init__(
+        self,
+        source: StreamSource,
+        config: StreamConfig,
+        *,
+        connect: Connector = ws_connect,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+        log: Callable[[str], None] | None = None,
+    ) -> None:
+        if not config.markets:
+            raise OpenTapeError("capture needs at least one market")
+        super().__init__(
+            output=config.output,
+            rotate_after=config.rotate_after,
+            source_tag=source.source_tag,
+            stats=StreamStats(),
+            log=log,
+        )
+        self.source = source
+        self.config = config
+        self._connect = connect
+        self._monotonic = monotonic
+        self._sleep = sleep
+        self._mirror = BookMirror()
+        self._deduper = TradeDeduper()
+        self._canonical: dict[str, str] = {}
+        #: Narrowed from the base class's :class:`TapeStats` for readers.
+        self.stats: StreamStats = StreamStats()
+
+    # -- main loop ---------------------------------------------------------
+
+    def run(self) -> StreamStats:
+        """Stream until the duration elapses, or until stopped, then flush."""
+        with _interrupt_handler(self.stop):
+            self._open_markets()
+            started = self._monotonic()
+            last_rotation = started
+            attempts = 0
+
+            while not self._stopping and not self._expired(started):
+                try:
+                    connection = self._open_connection()
+                except LiveError as exc:
+                    attempts += 1
+                    if attempts > self.config.max_reconnects:
+                        self._flush()
+                        raise LiveError(
+                            f"could not stay connected to {self.source.stream_url()} after "
+                            f"{attempts} attempt(s); last error: {exc}"
+                        ) from exc
+                    self.stats.reconnects += 1
+                    self._sleep(self.config.reconnect_backoff * attempts)
+                    continue
+
+                with connection:
+                    attempts = 0
+                    last_rotation = self._consume(connection, started, last_rotation)
+                if not self._stopping and not self._expired(started):
+                    # The server closed. Everything mirrored is now of
+                    # unknown age, so it is dropped rather than carried
+                    # across the gap.
+                    self._reset_books("the connection dropped")
+                    attempts += 1
+                    self.stats.reconnects += 1
+                    if attempts > self.config.max_reconnects:
+                        self._flush()
+                        raise LiveError(
+                            f"connection to {self.source.stream_url()} dropped "
+                            f"{attempts} time(s) in a row"
+                        )
+                    self._sleep(self.config.reconnect_backoff * attempts)
+
+            self._flush()
+        return self.stats
+
+    def _expired(self, started: float) -> bool:
+        return (
+            self.config.duration is not None and self._monotonic() - started >= self.config.duration
+        )
+
+    def _open_markets(self) -> None:
+        """Resolve every market before subscribing, as the poller does."""
+        for market_id in self.config.markets:
+            described = self.source.describe(market_id)
+            self._canonical[market_id] = described.market_id
+            self._descriptions[described.market_id] = described
+            self._log(f"tracking {described.market_id} ({described.status}): {described.title}")
+
+    def _open_connection(self) -> WebSocketConnection:
+        url = self.source.stream_url()
+        connection = self._connect(url, timeout=20.0)
+        connection.send_text(
+            self.source.subscribe_message([self._canonical[m] for m in self.config.markets])
+        )
+        self._log(f"subscribed to {len(self.config.markets)} market(s) on {url}")
+        return connection
+
+    def _consume(
+        self, connection: WebSocketConnection, started: float, last_rotation: float
+    ) -> float:
+        """Read messages until the connection ends or the run should stop."""
+        while not self._stopping and not self._expired(started):
+            try:
+                message = connection.recv_text(timeout=self.config.poll_wait)
+            except LiveError as exc:
+                self._log(f"stream ended: {exc}")
+                return last_rotation
+            if message is not None:
+                self.stats.messages += 1
+                self._handle(message)
+            now = self._monotonic()
+            if self.config.rotate_after and now - last_rotation >= self.config.rotate_after:
+                self._flush()
+                last_rotation = now
+        return last_rotation
+
+    def _reset_books(self, why: str) -> None:
+        for market_id in self._descriptions:
+            self._mirror.drop(market_id)
+        self._log(f"dropped every mirrored book because {why}")
+
+    # -- updates -----------------------------------------------------------
+
+    def _handle(self, message: str) -> None:
+        """Turn one venue message into tape events."""
+        for update in self.source.parse(message):
+            if isinstance(update, StreamBook):
+                events, check = self._mirror.snapshot(update, source=self._source_tag)
+                if check is not None:
+                    self.stats.checks += 1
+                    if not check.agreed:
+                        self.stats.divergences += 1
+                        self._log(check.summary())
+                for event in events:
+                    self._emit(event)
+            elif isinstance(update, StreamLevel):
+                if not self._mirror.has(update.market_id):
+                    self.stats.dropped_updates += 1
+                    continue
+                for event in self._mirror.level(update, source=self._source_tag):
+                    self._emit(event)
+            elif isinstance(update, StreamTrade):
+                tick = update.tick
+                if not self._deduper.is_new(f"{update.market_id}:{tick.trade_id}"):
+                    continue
+                self._emit(
+                    Trade(
+                        seq=0,
+                        ts=tick.ts,
+                        market_id=update.market_id,
+                        source=self._source_tag,
+                        outcome="YES",
+                        side=tick.side,
+                        price=tick.price,
+                        size=tick.size,
+                        trade_id=tick.trade_id,
+                    )
                 )
-            )
-            headers.append(
-                MarketStatus(
-                    seq=0,
-                    ts=ts,
-                    market_id=market_id,
-                    source=self.source.source_tag,
-                    status=described.status,
-                )
-            )
-        return [replace(event, seq=i) for i, event in enumerate(headers + body)]
-
-    def _flush(self) -> None:
-        """Write the buffered events to a tape file and clear the buffer.
-
-        A rotation with nothing observed writes no file: an empty tape
-        is a valid tape but a directory of them says nothing, and a
-        quiet market should not manufacture files.
-        """
-        events = self._prepare_segment(self._buffer)
-        self._buffer = []
-        if not events:
-            return
-        path = self._segment_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        Tape.from_events(events).write(path)
-        self.stats.files.append(path)
-        self.stats.events += len(events)
-        self._log(f"wrote {path}: {len(events):,} events")
 
 
 class _interrupt_handler:

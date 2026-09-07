@@ -31,3 +31,18 @@ run uv run opentape capture --venue "$VENUE" --market "$MARKET" \
 run uv run opentape inspect "$OUT"
 run uv run opentape replay "$OUT" --limit 10
 run uv run opentape book "$OUT" --depth 5
+
+# The websocket transport, where the venue publishes its own changes
+# instead of being asked. Only Polymarket has a public stream that needs
+# no credentials: Kalshi's answers HTTP 401 to an unauthenticated
+# upgrade, so there is nothing here to run for it.
+if [ "$VENUE" = "polymarket" ]; then
+    WS_OUT="${TMPDIR:-/tmp}/opentape-live-${VENUE}-ws.parquet"
+    rm -f "$WS_OUT"
+    echo
+    echo "== the same market over the venue's websocket =="
+    run uv run opentape capture --venue "$VENUE" --transport websocket \
+        --market "$MARKET" -o "$WS_OUT" --duration "$DURATION"
+    run uv run opentape inspect "$WS_OUT"
+    run uv run opentape replay "$WS_OUT" --limit 10
+fi

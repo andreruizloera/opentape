@@ -1,6 +1,7 @@
 name: Live check
 
-# Runs a real capture against both venues' public endpoints.
+# Runs a real capture against both venues' public endpoints, and for
+# Polymarket over the websocket transport as well as REST polling.
 #
 # Manual only, deliberately. The recorded payloads in
 # tests/fixtures/live/ are the risk this job exists to manage: if a

@@ -24,7 +24,10 @@ from opentape.live import (
     CaptureConfig,
     CaptureDaemon,
     HttpFetcher,
+    StreamConfig,
+    StreamDaemon,
     build_source,
+    build_stream_source,
     parse_duration,
 )
 from opentape.tape import Tape
@@ -208,11 +211,13 @@ def _cmd_markets(args: argparse.Namespace) -> int:
 
 
 def _cmd_capture(args: argparse.Namespace) -> int:
+    if args.transport == "websocket":
+        return _cmd_capture_stream(args)
     source = build_source(args.venue, HttpFetcher(timeout=args.timeout))
     config = CaptureConfig(
         markets=tuple(args.market),
         output=Path(args.output),
-        poll_interval=parse_duration(args.poll, flag="--poll"),
+        poll_interval=parse_duration(args.poll or "2s", flag="--poll"),
         duration=parse_duration(args.duration, flag="--duration") if args.duration else None,
         rotate_after=parse_duration(args.rotate, flag="--rotate") if args.rotate else None,
         resnapshot_every=args.snapshot_every,
@@ -222,7 +227,10 @@ def _cmd_capture(args: argparse.Namespace) -> int:
     if not args.quiet:
         span = f" for {args.duration}" if args.duration else " until interrupted"
         print(f"capturing {len(config.markets)} market(s) from {args.venue}{span}")
-        print(f"polling every {args.poll}; press Ctrl-C to stop and write what has been captured")
+        print(
+            f"polling every {args.poll or '2s'}; "
+            f"press Ctrl-C to stop and write what has been captured"
+        )
     daemon = CaptureDaemon(source, config, log=log)
     stats = daemon.run()
     print(
@@ -231,6 +239,58 @@ def _cmd_capture(args: argparse.Namespace) -> int:
         + (f", {stats.failed_polls:,} failed polls" if stats.failed_polls else "")
         + ")"
     )
+    if not stats.files:
+        print("no events were captured, so no tape was written")
+        return 1
+    for path in stats.files:
+        print(f"wrote {path}")
+    return 0
+
+
+def _cmd_capture_stream(args: argparse.Namespace) -> int:
+    """capture --transport websocket: subscribe instead of polling."""
+    for flag, value in (("--poll", args.poll), ("--snapshot-every", args.snapshot_every)):
+        if value:
+            raise OpenTapeError(
+                f"{flag} applies to --transport rest-poll only; a websocket capture has no "
+                f"poll interval, and the venue publishes its own snapshots"
+            )
+    if args.backfill:
+        raise OpenTapeError(
+            "--backfill applies to --transport rest-poll only; a streamed tape holds "
+            "exactly the events published while it was connected, which is the property "
+            "that makes it worth streaming"
+        )
+    source = build_stream_source(args.venue, HttpFetcher(timeout=args.timeout))
+    config = StreamConfig(
+        markets=tuple(args.market),
+        output=Path(args.output),
+        duration=parse_duration(args.duration, flag="--duration") if args.duration else None,
+        rotate_after=parse_duration(args.rotate, flag="--rotate") if args.rotate else None,
+    )
+    log = (lambda msg: None) if args.quiet else (lambda msg: print(msg, flush=True))
+    if not args.quiet:
+        span = f" for {args.duration}" if args.duration else " until interrupted"
+        print(f"streaming {len(config.markets)} market(s) from {args.venue}{span}")
+        print(f"connecting to {source.stream_url()}; press Ctrl-C to stop and write the tape")
+    stats = StreamDaemon(source, config, log=log).run()
+    checked = (
+        f", {stats.checks:,} snapshot check(s) with {stats.divergences:,} divergence(s)"
+        if stats.checks
+        else ""
+    )
+    print(
+        f"captured {stats.events:,} events from {stats.messages:,} messages "
+        f"({stats.snapshots:,} snapshots, {stats.deltas:,} deltas, {stats.trades:,} trades"
+        + (f", {stats.reconnects:,} reconnects" if stats.reconnects else "")
+        + ")"
+        + checked
+    )
+    if stats.dropped_updates:
+        print(
+            f"{stats.dropped_updates:,} level update(s) arrived before the first snapshot "
+            f"for their market and were dropped rather than applied to an empty book"
+        )
     if not stats.files:
         print("no events were captured, so no tape was written")
         return 1
@@ -306,14 +366,24 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_capture = sub.add_parser(
         "capture",
-        help="poll a live venue and write canonical tapes",
-        description="Poll a venue's public endpoints on an interval and write a canonical "
-        "tape. Only unauthenticated endpoints are used, so no credentials are needed. "
-        "A poll interval is a sampling rate, not a subscription: changes that happen and "
-        "reverse between two polls are not captured, and the source column records that "
-        "the tape was polled.",
+        help="capture a live venue and write canonical tapes",
+        description="Capture a venue's public market data into a canonical tape. Only "
+        "unauthenticated endpoints are used, so no credentials are needed. Two transports "
+        "are available and they produce different kinds of tape. --transport rest-poll "
+        "samples the book on an interval: changes that happen and reverse between two polls "
+        "are not captured. --transport websocket subscribes to the venue's own change "
+        "stream, so every delta in the tape is a change the venue published. The source "
+        "column records which transport was used.",
     )
     p_capture.add_argument("--venue", required=True, choices=sorted(SOURCES), help="venue to poll")
+    p_capture.add_argument(
+        "--transport",
+        choices=("rest-poll", "websocket"),
+        default="rest-poll",
+        help="how to read the venue: rest-poll (default) samples on --poll, websocket "
+        "subscribes to the venue's change stream. Websocket is available for venues whose "
+        "stream needs no credentials, which today is polymarket only",
+    )
     p_capture.add_argument(
         "--market",
         action="append",
@@ -322,7 +392,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="market to capture; repeat for several (see 'opentape markets')",
     )
     p_capture.add_argument("-o", "--output", required=True, help="output .parquet path")
-    p_capture.add_argument("--poll", default="2s", help="poll interval (default 2s)")
+    p_capture.add_argument(
+        "--poll",
+        default=None,
+        help="poll interval for --transport rest-poll (default 2s)",
+    )
     p_capture.add_argument(
         "--duration", default=None, help="stop after this long (default: run until interrupted)"
     )

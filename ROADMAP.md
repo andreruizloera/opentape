@@ -7,18 +7,31 @@ says otherwise.
 
 `opentape capture` SHIPPED, over the public unauthenticated REST
 endpoints of Kalshi and Polymarket, with rotation and with
-re-snapshotting after a dropped poll. See the README. What is still
-open:
+re-snapshotting after a dropped poll. See the README.
 
-- Websocket transports for both venues, so the tape stops being a
-  sample of the book and becomes the venue's own change stream.
-  Kalshi's orderbook and trade channels and Polymarket's CLOB socket
-  are the two targets, and both would keep the same `LiveSource`
-  boundary the REST sources use.
-- Authenticated feeds: Kalshi's signed API and Polymarket's
-  authenticated CLOB endpoints, both of which need keys. The fetcher
-  is already injected, so this is a credentials and signing question
-  rather than a structural one.
+`capture --transport websocket` SHIPPED for Polymarket, over the public
+market channel, with a book mirror that checks its reconstruction
+against the venue's own periodic snapshots and reports divergence. The
+Kalshi half of this item is NOT shipped and is blocked on the item
+below it: Kalshi's websocket answers HTTP 401 to an unauthenticated
+upgrade, so it needs a key. What is still open:
+
+- Authenticated feeds: Kalshi's signed API, its websocket included, and
+  Polymarket's authenticated CLOB endpoints, all of which need keys.
+  The fetcher is already injected and the daemon already owns the
+  socket, so this is a credentials and signing question rather than a
+  structural one.
+- Order-level Polymarket channels, if the venue exposes them. The
+  market channel is level-based, which is what schema v1 describes, so
+  this waits on the schema item below rather than on the transport.
+- Use the `hash` field the venue publishes on each book and price
+  change. Today the mirror is checked against full snapshots when they
+  happen to arrive; a per-message hash would catch a divergence at the
+  message that caused it rather than at the next snapshot.
+- Reconnect with backoff that survives a long outage. Today the attempt
+  count is bounded and a capture gives up rather than retrying forever,
+  which is the right default for a fixed `--duration` and the wrong one
+  for a daemon meant to run for a week.
 - Re-read a market's status while a capture runs, so a market that
   closes or halts mid-capture records the change instead of keeping
   the status it had when the capture started.
