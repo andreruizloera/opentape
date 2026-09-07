@@ -59,3 +59,9 @@ jobs:
           grep -q 'status changes observed: 1' /tmp/demo.txt
           grep -q 'seq=1  15:20:00  status=open' /tmp/demo.txt
           grep -q 'seq=7  15:20:04  status=closed' /tmp/demo.txt
+          # The settlement half of the same demo part. The close and the
+          # resolution are separate rows at separate times on purpose,
+          # so both timestamps are checked and not just the outcome.
+          grep -q 'DEMO-CLOSE resolved: YES settles at 1' /tmp/demo.txt
+          grep -q 'settlements observed:    1' /tmp/demo.txt
+          grep -q 'seq=10  15:20:06  resolution=YES settles at 1' /tmp/demo.txt

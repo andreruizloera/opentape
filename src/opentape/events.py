@@ -78,7 +78,20 @@ class MarketStatus(_EventBase):
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Resolution(_EventBase):
-    """Final settlement: the winning outcome and its settlement value."""
+    """Final settlement: the winning outcome and its settlement value.
+
+    ``outcome`` names the WINNING outcome as the venue spells it, which
+    is the one place in the schema where that column is not the string
+    ``"YES"``. ``settlement`` is what that outcome pays, so it is 1.0 on
+    an ordinary binary market whichever side won.
+
+    A tape is otherwise entirely in YES terms, so the obvious question
+    is what YES settled at, and it is recoverable from the tape alone
+    without a second source: the market row for the same ``market_id``
+    lists ``outcomes`` with the YES side first, so YES settled at
+    ``settlement`` when ``outcome`` equals ``outcomes[0]`` and at
+    ``1 - settlement`` otherwise.
+    """
 
     outcome: str
     settlement: float

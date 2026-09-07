@@ -223,6 +223,11 @@ def _report_status(stats: TapeStats) -> None:
             f"{stats.status_changes:,} market status change(s) were observed and "
             f"written to the tape"
         )
+    if stats.resolutions:
+        print(
+            f"{stats.resolutions:,} market(s) settled while capturing and were written "
+            f"to the tape as resolution rows"
+        )
     if stats.status_check_failures:
         print(
             f"{stats.status_check_failures:,} status check(s) failed; the tape's status "
@@ -467,15 +472,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--status-every",
         default=None,
         metavar="DURATION",
-        help="re-read each market's lifecycle status this often, so a market that closes "
-        "or halts mid-capture is recorded when it happens (default 30s). Applies to both "
-        "transports: a change stream carries book and trade messages, not lifecycle",
+        help="re-read each market's lifecycle this often, so a market that closes, halts, "
+        "or settles mid-capture is recorded when it happens (default 30s). Applies to both "
+        "transports: a change stream carries book and trade messages, not lifecycle. A "
+        "settlement comes from the same request as the status, so it costs nothing extra",
     )
     p_capture.add_argument(
         "--no-status-check",
         action="store_true",
-        help="read each market's status once at the start and never again. The tape then "
-        "states the status the capture opened with, whatever happened after",
+        help="read each market's lifecycle once at the start and never again. The tape then "
+        "states the status the capture opened with, whatever happened after, and no "
+        "settlement that happens during the capture is recorded",
     )
     p_capture.add_argument(
         "--timeout", type=float, default=10.0, help="per-request timeout in seconds"

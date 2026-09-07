@@ -42,10 +42,16 @@ upgrade, so it needs a key. What is still open:
   Today `--status-every` records the close and the loop keeps polling a
   book that will not move again, which is correct but wasteful on a
   long `--duration`.
-- Resolution capture: a `resolution` row when a venue publishes the
-  winning outcome. `market_status` says the market stopped trading,
-  which is not the same as saying how it settled, and schema v1 already
-  has the event type.
+- Re-settlement: a venue that publishes a winner and later changes it
+  writes one row today, the first one. A second row would be
+  indistinguishable from an ordinary settlement in a tape sorted by
+  time, so this needs a way to say "this supersedes the earlier one"
+  that schema v1 does not have.
+- Settlement on a venue that pays something other than 0 or 1. Both
+  supported venues settle binary markets at the ends, and the reader
+  carries the winner's own published value rather than assuming 1.0,
+  but nothing has exercised a partial settlement because neither venue
+  produced one to test against.
 - Adaptive poll pacing: back off on a market whose book has not moved
   in a while and spend the request budget on the ones that are, which
   matters once a single capture tracks many markets.

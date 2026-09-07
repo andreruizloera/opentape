@@ -13,13 +13,22 @@ from typing import ClassVar
 import pytest
 
 from opentape.errors import LiveError, OpenTapeError
-from opentape.events import BookDelta, BookLevel, Market, MarketStatus, OrderBookSnapshot, Trade
+from opentape.events import (
+    BookDelta,
+    BookLevel,
+    Market,
+    MarketStatus,
+    OrderBookSnapshot,
+    Resolution,
+    Trade,
+)
 from opentape.live.base import (
     BookQuote,
     BookTracker,
     LiveSource,
     MarketDescription,
     MarketRef,
+    MarketResolution,
     TradeDeduper,
     TradeTick,
 )
@@ -183,6 +192,7 @@ class FakeSource(LiveSource):
         market_id: str = "M1",
         status: str = "open",
         statuses: list[str | Exception] | None = None,
+        resolutions: list[MarketResolution | None] | None = None,
     ) -> None:
         self.books = books
         self.trade_pages = trades or []
@@ -191,6 +201,9 @@ class FakeSource(LiveSource):
         #: One answer per describe() call, the last one repeating. None
         #: means every call answers ``status``.
         self.statuses = statuses
+        #: One settlement per describe() call, the last one repeating,
+        #: on the same rule as ``statuses``.
+        self.resolutions = resolutions
         self.book_calls = 0
         self.trade_calls = 0
         self.describe_calls = 0
@@ -209,7 +222,15 @@ class FakeSource(LiveSource):
             if isinstance(answer, Exception):
                 raise answer
             status = answer
-        return MarketDescription(market_id=self.market_id, title="A fake market", status=status)
+        resolution = None
+        if self.resolutions:
+            resolution = self.resolutions[min(index, len(self.resolutions) - 1)]
+        return MarketDescription(
+            market_id=self.market_id,
+            title="A fake market",
+            status=status,
+            resolution=resolution,
+        )
 
     def book(self, market_id: str) -> BookQuote:
         result = self.books[min(self.book_calls, len(self.books) - 1)]
@@ -677,3 +698,225 @@ def test_a_status_check_uses_the_id_the_user_typed(tmp_path: Path) -> None:
 
     assert source.describe_calls == 2
     assert set(source.described) == {"some-slug"}
+
+
+# -- settlement while capturing -------------------------------------------
+
+
+def _resolutions(path: Path) -> list[tuple[int, str, float]]:
+    """Every resolution row on a tape, in replay order."""
+    return [
+        (e.seq, e.outcome, e.settlement)
+        for e in Tape.read(path).replay(speed="max")
+        if isinstance(e, Resolution)
+    ]
+
+
+SETTLED = MarketResolution(outcome="YES", settlement=1.0)
+
+
+def test_a_market_that_settles_mid_capture_gets_a_resolution_row(tmp_path: Path) -> None:
+    # market_status says a market stopped trading. It does not say how
+    # it settled, and on a real venue the two arrive minutes apart.
+    source = FakeSource(
+        [quote({0.6: float(i)}, {}) for i in range(1, 20)],
+        statuses=["open", "closed", "closed"],
+        resolutions=[None, None, SETTLED],
+    )
+    daemon, logs = run(source, tmp_path, poll_interval=1.0, duration=8.0, status_every=2.0)
+
+    assert daemon.stats.resolutions == 1
+    assert _resolutions(daemon.stats.files[0]) == [(8, "YES", 1.0)]
+    assert "M1 resolved: YES settles at 1" in logs
+    # The check at +2s saw it close and the check at +4s saw it settle,
+    # which is the shape a real venue produces. The tape reads forward
+    # in that order.
+    rows = list(Tape.read(daemon.stats.files[0]).replay(speed="max"))
+    closed = next(e for e in rows if isinstance(e, MarketStatus) and e.status == "closed")
+    settled = next(e for e in rows if isinstance(e, Resolution))
+    assert closed.seq < settled.seq
+    assert closed.ts < settled.ts
+
+
+def test_a_settlement_is_written_once_no_matter_how_often_it_is_reported(
+    tmp_path: Path,
+) -> None:
+    # A resolution is final, so a venue repeating it on every check must
+    # not fill the tape with rows that say the same thing.
+    source = FakeSource(
+        [quote({0.6: float(i)}, {}) for i in range(1, 20)],
+        statuses=["open", "closed"],
+        resolutions=[None, SETTLED],
+    )
+    daemon, _ = run(source, tmp_path, poll_interval=1.0, duration=10.0, status_every=1.0)
+
+    assert daemon.stats.resolutions == 1
+    assert len(_resolutions(daemon.stats.files[0])) == 1
+
+
+def test_an_unsettled_market_writes_no_resolution_row(tmp_path: Path) -> None:
+    source = FakeSource(
+        [quote({0.6: float(i)}, {}) for i in range(1, 20)],
+        statuses=["open", "closed"],
+    )
+    daemon, _ = run(source, tmp_path, poll_interval=1.0, duration=8.0, status_every=2.0)
+
+    assert daemon.stats.resolutions == 0
+    assert _resolutions(daemon.stats.files[0]) == []
+    # The status row is still there. Closed is a real observation; it
+    # just is not a settlement.
+    assert [s for _, s in _statuses(daemon.stats.files[0])] == ["open", "closed"]
+
+
+def test_a_resolution_row_carries_the_venue_settlement_time_when_there_is_one(
+    tmp_path: Path,
+) -> None:
+    # Kalshi publishes settlement_ts, so the row does not have to be
+    # stamped with the observation time that --status-every bounds.
+    venue_time = START + timedelta(seconds=1)
+    source = FakeSource(
+        [quote({0.6: float(i)}, {}) for i in range(1, 20)],
+        statuses=["open", "closed"],
+        resolutions=[None, MarketResolution(outcome="NO", settlement=1.0, ts=venue_time)],
+    )
+    daemon, _ = run(source, tmp_path, poll_interval=1.0, duration=8.0, status_every=4.0)
+
+    rows = list(Tape.read(daemon.stats.files[0]).replay(speed="max"))
+    resolution = next(e for e in rows if isinstance(e, Resolution))
+    assert resolution.ts == venue_time
+    # The check that observed it ran at +4s, so the venue's own stamp is
+    # three seconds earlier than the moment the capture noticed.
+    assert resolution.ts < START + timedelta(seconds=4)
+
+
+def test_a_resolution_without_a_venue_time_is_stamped_when_it_was_observed(
+    tmp_path: Path,
+) -> None:
+    # Polymarket publishes no settlement time, so the row's timestamp is
+    # an upper bound set by --status-every, exactly like a status row.
+    source = FakeSource(
+        [quote({0.6: float(i)}, {}) for i in range(1, 20)],
+        statuses=["open", "closed"],
+        resolutions=[None, MarketResolution(outcome="No", settlement=1.0)],
+    )
+    daemon, _ = run(source, tmp_path, poll_interval=1.0, duration=8.0, status_every=4.0)
+
+    rows = list(Tape.read(daemon.stats.files[0]).replay(speed="max"))
+    resolution = next(e for e in rows if isinstance(e, Resolution))
+    assert resolution.ts == START + timedelta(seconds=4)
+
+
+def test_the_segment_after_a_settlement_opens_with_a_resolution_header(
+    tmp_path: Path,
+) -> None:
+    # The same rotation rule the status header follows, one level on: a
+    # reader who picks up a late segment alone still learns how the
+    # market ended.
+    source = FakeSource(
+        [quote({0.6: float(i)}, {}) for i in range(1, 20)],
+        statuses=["open", "open", "closed"],
+        resolutions=[None, None, SETTLED],
+    )
+    daemon, _ = run(
+        source, tmp_path, poll_interval=1.0, duration=8.0, rotate_after=2.0, status_every=2.0
+    )
+
+    assert len(daemon.stats.files) == 4
+    per_file = [[o for _, o, _ in _resolutions(p)] for p in daemon.stats.files]
+    # Segment 1 was before the settlement. Segment 2 watched it happen
+    # and carries the observed row. Segments 3 and 4 open with a header.
+    assert per_file == [[], ["YES"], ["YES"], ["YES"]]
+    # Only the one in segment 2 was observed; the rest are headers.
+    assert daemon.stats.resolutions == 1
+
+
+def test_a_resolution_header_sorts_after_the_status_header_of_its_segment(
+    tmp_path: Path,
+) -> None:
+    source = FakeSource(
+        [quote({0.6: float(i)}, {}) for i in range(1, 20)],
+        statuses=["open", "closed"],
+        resolutions=[None, SETTLED],
+    )
+    daemon, _ = run(
+        source, tmp_path, poll_interval=1.0, duration=8.0, rotate_after=2.0, status_every=2.0
+    )
+
+    last = list(Tape.read(daemon.stats.files[-1]).replay(speed="max"))
+    assert isinstance(last[0], Market)
+    assert isinstance(last[1], MarketStatus)
+    assert isinstance(last[2], Resolution)
+    seqs = [e.seq for e in last]
+    assert seqs == sorted(seqs)
+
+
+def test_a_market_already_settled_when_the_capture_starts_is_a_header_not_an_event(
+    tmp_path: Path,
+) -> None:
+    # Nothing about it happened while the tape was being written, so it
+    # is not counted as something this capture observed.
+    source = FakeSource(
+        [quote({0.6: float(i)}, {}) for i in range(1, 20)],
+        status="closed",
+        resolutions=[SETTLED],
+    )
+    daemon, _ = run(source, tmp_path, poll_interval=1.0, duration=4.0, status_every=2.0)
+
+    assert daemon.stats.resolutions == 0
+    assert _resolutions(daemon.stats.files[0]) == [(2, "YES", 1.0)]
+
+
+def test_no_status_check_still_records_a_settlement_known_at_the_start(
+    tmp_path: Path,
+) -> None:
+    source = FakeSource(
+        [quote({0.6: float(i)}, {}) for i in range(1, 20)],
+        status="closed",
+        resolutions=[SETTLED],
+    )
+    daemon, _ = run(source, tmp_path, poll_interval=1.0, duration=4.0, status_every=None)
+
+    assert source.describe_calls == 1
+    assert [o for _, o, _ in _resolutions(daemon.stats.files[0])] == ["YES"]
+
+
+def test_a_failed_status_check_cannot_invent_a_settlement(tmp_path: Path) -> None:
+    source = FakeSource(
+        [quote({0.6: float(i)}, {}) for i in range(1, 12)],
+        statuses=["open", LiveError("status endpoint 503")],
+        resolutions=[None, SETTLED],
+    )
+    daemon, _ = run(source, tmp_path, poll_interval=1.0, duration=6.0, status_every=2.0)
+
+    assert daemon.stats.status_check_failures == 2
+    assert daemon.stats.resolutions == 0
+    assert _resolutions(daemon.stats.files[0]) == []
+
+
+def test_a_refused_settlement_also_costs_that_checks_status_update(
+    tmp_path: Path,
+) -> None:
+    # The status and the settlement come from one document, so a source
+    # that refuses the settlement gives up the status for that check
+    # too. The next check recovers it. Written down because the
+    # alternative, blessing a status out of a document the source could
+    # not fully parse, is the worse trade.
+    class RefusingSource(FakeSource):
+        def describe(self, market_id: str) -> MarketDescription:
+            self.describe_calls += 1
+            self.described.append(market_id)
+            if self.describe_calls == 2:
+                raise LiveError("two winning outcomes")
+            return MarketDescription(
+                market_id=self.market_id,
+                title="A fake market",
+                status="open" if self.describe_calls == 1 else "closed",
+            )
+
+    source = RefusingSource([quote({0.6: float(i)}, {}) for i in range(1, 12)])
+    daemon, _ = run(source, tmp_path, poll_interval=1.0, duration=6.0, status_every=2.0)
+
+    assert daemon.stats.status_check_failures == 1
+    assert daemon.stats.resolutions == 0
+    # The check at +2s was refused; the one at +4s recorded the close.
+    assert _statuses(daemon.stats.files[0]) == [(1, "open"), (7, "closed")]

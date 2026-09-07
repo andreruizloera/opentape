@@ -66,7 +66,18 @@ Notes:
 - `trade` records the traded price and size; `side` is the aggressor.
 - `resolution` reuses the `price` column for the settlement value per
   contract (1.0 for a winning binary outcome, 0.0 for a losing one;
-  scalar markets may settle anywhere in [0, 1]).
+  scalar markets may settle anywhere in [0, 1]). Its `outcome` column
+  names the WINNING outcome as the venue spells it, which is the one
+  place in the schema where that column is not the string `YES`, and
+  `price` is what THAT outcome pays. What the YES side settled at is
+  recoverable from the tape alone: the `market` row for the same
+  `market_id` lists `outcomes` with the YES side first, so YES settled
+  at `price` when `outcome` equals `outcomes[0]` and at `1 - price`
+  otherwise.
+- A `market_status` of `closed` and a `resolution` are different facts
+  arriving at different times: the first says the market stopped
+  trading, the second says how it settled. A tape can carry the first
+  without the second, and a live capture routinely does.
 
 ## Ordering
 

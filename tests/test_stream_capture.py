@@ -298,3 +298,90 @@ def test_a_failed_status_check_does_not_end_a_streamed_capture(tmp_path: Path) -
     assert stats.status_changes == 0
     assert stats.events > 0
     assert (tmp_path / "tape.parquet").exists()
+
+
+# -- settlement on a streamed capture -------------------------------------
+
+
+class SettlingFetcher(FakeFetcher):
+    """A fetcher whose market closes, then settles, on later reads.
+
+    The two happen on separate reads on purpose. A venue closes a market
+    and settles it at different moments, and the streamed path has to
+    survive a market that is closed but carries no winner yet exactly as
+    the polled one does.
+    """
+
+    def __init__(self, market: Any) -> None:
+        super().__init__(market)
+        self.market_reads = 0
+
+    def __call__(self, url: str, params: dict[str, Any] | None = None) -> Any:
+        if "gamma-api" in url:
+            return [{"conditionId": self.market["condition_id"]}]
+        self.market_reads += 1
+        if self.market_reads == 1:
+            return self.market
+        closed = dict(self.market, closed=True)
+        if self.market_reads == 2:
+            # Closed, no winner yet. This must not produce a resolution.
+            return closed
+        tokens = [dict(t) for t in closed["tokens"]]
+        tokens[1]["winner"] = True
+        tokens[1]["price"] = 1
+        return dict(closed, tokens=tokens)
+
+
+def test_a_streamed_capture_records_a_settlement(tmp_path: Path) -> None:
+    # The change stream carries no lifecycle message at all, so a
+    # settlement is a REST question on a streamed tape exactly as a
+    # close is. This is the transport the last two capture bugs were
+    # found on, so it is exercised rather than assumed to share code.
+    market = json.loads((LIVE_FIXTURES / "polymarket_ws_market.json").read_text())
+    fetcher = SettlingFetcher(market)
+    logs: list[str] = []
+    with StreamReplayServer(recorded()) as server:
+        source = PolymarketStream(PolymarketLive(fetcher), url=server.url)
+        stats = run(server, tmp_path, source=source, status_every=0.01, log=logs)
+
+    assert fetcher.market_reads >= 3
+    assert stats.resolutions == 1
+    rows = list(Tape.read(tmp_path / "tape.parquet").replay(speed="max"))
+    resolutions = [e for e in rows if type(e).__name__ == "Resolution"]
+    assert len(resolutions) == 1
+    assert resolutions[0].outcome == market["tokens"][1]["outcome"]
+    assert resolutions[0].settlement == 1.0
+    # Closed came first and settled after it, on the tape as in reality.
+    closed = next(e for e in rows if type(e).__name__ == "MarketStatus" and e.status == "closed")
+    assert closed.seq < resolutions[0].seq
+    assert any("resolved:" in line for line in logs)
+
+
+def test_a_streamed_capture_of_a_closed_market_writes_no_settlement(
+    tmp_path: Path,
+) -> None:
+    # The read that sees closed-and-unsettled must write a status row
+    # and nothing else. A real Kalshi market sat in exactly this state
+    # for 28 minutes; see tests/fixtures/live/kalshi_market_closed.json.
+    market = json.loads((LIVE_FIXTURES / "polymarket_ws_market.json").read_text())
+
+    class ClosedNeverSettles(FakeFetcher):
+        def __init__(self, m: Any) -> None:
+            super().__init__(m)
+            self.market_reads = 0
+
+        def __call__(self, url: str, params: dict[str, Any] | None = None) -> Any:
+            if "gamma-api" in url:
+                return [{"conditionId": self.market["condition_id"]}]
+            self.market_reads += 1
+            return self.market if self.market_reads == 1 else dict(self.market, closed=True)
+
+    fetcher = ClosedNeverSettles(market)
+    with StreamReplayServer(recorded()) as server:
+        source = PolymarketStream(PolymarketLive(fetcher), url=server.url)
+        stats = run(server, tmp_path, source=source, status_every=0.01)
+
+    assert stats.status_changes >= 1
+    assert stats.resolutions == 0
+    rows = list(Tape.read(tmp_path / "tape.parquet").replay(speed="max"))
+    assert [e for e in rows if type(e).__name__ == "Resolution"] == []

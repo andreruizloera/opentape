@@ -453,3 +453,146 @@ def test_polymarket_a_refresh_asks_the_clob_by_condition_id_not_by_slug() -> Non
     for url in market_calls:
         assert url.endswith(fetch.market["condition_id"])
         assert SLUG not in url
+
+
+def polymarket_for(doc: Any) -> tuple[PolymarketLive, FakeFetcher]:
+    """A source whose CLOB market document is ``doc``, slug included."""
+    return polymarket(**{"/markets/": doc, "gamma-api": [{"conditionId": doc["condition_id"]}]})
+
+
+# -- settlement, on both venues -------------------------------------------
+#
+# A market stopping trading and a market settling are two different
+# facts arriving at two different times, and the fixtures prove it
+# rather than the tests asserting it: kalshi_market_closed.json is a
+# real market that had been closed for 28 minutes and still published
+# an empty result.
+
+
+def test_kalshi_an_open_market_has_no_resolution() -> None:
+    source, _ = kalshi()
+    assert source.describe("KXELONMARS-99").resolution is None
+
+
+def test_kalshi_a_closed_market_is_not_a_settled_one() -> None:
+    # The whole reason a resolution row exists. This fixture's market
+    # closed at 17:30 UTC and was still reporting result "" when it was
+    # recorded, despite advertising settlement_timer_seconds: 5.
+    doc = load("kalshi_market_closed.json")
+    assert doc["market"]["status"] == "closed"
+    assert doc["market"]["result"] == ""
+    source, _ = kalshi(**{"/markets/": doc})
+    described = source.describe(doc["market"]["ticker"])
+    assert described.status == "closed"
+    assert described.resolution is None
+
+
+def test_kalshi_a_settled_market_reports_its_winner_and_venue_timestamp() -> None:
+    doc = load("kalshi_market_settled.json")
+    source, _ = kalshi(**{"/markets/": doc})
+    resolution = source.describe(doc["market"]["ticker"]).resolution
+    assert resolution is not None
+    assert resolution.outcome == "YES"
+    assert resolution.settlement == 1.0
+    # Kalshi publishes settlement_ts, so the row does not have to be
+    # stamped with local observation time.
+    assert resolution.ts is not None
+    assert resolution.ts.isoformat().startswith("2026-09-07T17:45:15")
+
+
+def test_kalshi_a_no_result_pays_the_no_side_not_zero() -> None:
+    # settlement_value_dollars is the YES contract's value, so it is
+    # "0.0000" on a market that resolved NO. Taking it at face value
+    # would write "NO won and pays 0.00", which is the opposite of what
+    # happened.
+    doc = load("kalshi_market_settled.json")
+    doc["market"] = dict(doc["market"], result="no", settlement_value_dollars="0.0000")
+    source, _ = kalshi(**{"/markets/": doc})
+    resolution = source.describe(doc["market"]["ticker"]).resolution
+    assert resolution is not None
+    assert resolution.outcome == "NO"
+    assert resolution.settlement == 1.0
+
+
+def test_kalshi_reads_the_legacy_integer_cent_settlement_value() -> None:
+    doc = load("kalshi_market_settled.json")
+    doc["market"] = dict(doc["market"], settlement_value_dollars=None, settlement_value=100)
+    source, _ = kalshi(**{"/markets/": doc})
+    resolution = source.describe(doc["market"]["ticker"]).resolution
+    assert resolution is not None
+    assert resolution.settlement == 1.0
+
+
+def test_kalshi_a_result_with_no_settlement_value_is_refused_not_guessed() -> None:
+    doc = load("kalshi_market_settled.json")
+    doc["market"] = dict(doc["market"], settlement_value_dollars=None, settlement_value=None)
+    source, _ = kalshi(**{"/markets/": doc})
+    with pytest.raises(LiveError, match="publishes no settlement value"):
+        source.describe(doc["market"]["ticker"])
+
+
+def test_kalshi_a_non_binary_result_is_refused_by_name() -> None:
+    doc = load("kalshi_market_settled.json")
+    doc["market"] = dict(doc["market"], result="void")
+    source, _ = kalshi(**{"/markets/": doc})
+    with pytest.raises(LiveError, match="'void'"):
+        source.describe(doc["market"]["ticker"])
+
+
+def test_polymarket_an_open_market_has_no_resolution() -> None:
+    # Both tokens carry winner: false while the market trades, so the
+    # live price on each is not mistaken for a settlement value.
+    source, _ = polymarket()
+    assert source.describe(SLUG).resolution is None
+
+
+def test_polymarket_a_resolved_market_names_the_winning_outcome() -> None:
+    doc = load("polymarket_market_resolved.json")
+    source, _ = polymarket_for(doc)
+    described = source.describe(doc["market_slug"])
+    assert described.status == "closed"
+    assert described.resolution is not None
+    assert described.resolution.outcome == "No"
+    assert described.resolution.settlement == 1.0
+    # The venue publishes no settlement time, so the daemon has to
+    # stamp the row when it observed the change.
+    assert described.resolution.ts is None
+
+
+def test_polymarket_the_winner_is_recoverable_as_a_yes_settlement() -> None:
+    # A tape is in YES terms, so what a reader wants is what YES paid.
+    # It is recoverable from the tape alone: the market row lists
+    # outcomes with the YES side first.
+    doc = load("polymarket_market_resolved.json")
+    source, _ = polymarket_for(doc)
+    described = source.describe(doc["market_slug"])
+    assert described.outcomes == ("Yes", "No")
+    assert described.resolution is not None
+    yes_settled = (
+        described.resolution.settlement
+        if described.resolution.outcome == described.outcomes[0]
+        else 1.0 - described.resolution.settlement
+    )
+    assert yes_settled == 0.0
+
+
+def test_polymarket_two_winning_tokens_are_refused_and_both_named() -> None:
+    # A contradictory document. Choosing one would put an invented
+    # settlement on a tape that exists to be trusted.
+    doc = load("polymarket_market_resolved.json")
+    doc = dict(doc, tokens=[dict(t, winner=True) for t in doc["tokens"]])
+    source, _ = polymarket_for(doc)
+    with pytest.raises(LiveError, match="marks 2 outcomes as the winner") as excinfo:
+        source.describe(doc["market_slug"])
+    assert "'Yes'" in str(excinfo.value)
+    assert "'No'" in str(excinfo.value)
+
+
+def test_polymarket_a_winning_token_with_no_name_is_refused() -> None:
+    doc = load("polymarket_market_resolved.json")
+    tokens = [dict(t) for t in doc["tokens"]]
+    tokens[1]["outcome"] = ""
+    doc = dict(doc, tokens=tokens)
+    source, _ = polymarket_for(doc)
+    with pytest.raises(LiveError, match="no outcome name"):
+        source.describe(doc["market_slug"])

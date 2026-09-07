@@ -42,6 +42,7 @@ from opentape.live.base import (
     LiveSource,
     MarketDescription,
     MarketRef,
+    MarketResolution,
     TradeTick,
 )
 from opentape.live.http import Fetcher
@@ -237,6 +238,55 @@ class PolymarketLive(LiveSource):
             title=resolved.question,
             status=status,
             outcomes=resolved.outcomes,
+            resolution=self._resolution(resolved),
+        )
+
+    @staticmethod
+    def _resolution(resolved: _Resolved) -> MarketResolution | None:
+        """Read Polymarket's settlement from the outcome tokens.
+
+        The market document carries no settlement field. What it carries
+        is a ``winner`` flag per token, and the rule was checked against
+        the live CLOB rather than assumed: across 60 closed markets,
+        every one had exactly two tokens, exactly one winner, the
+        winner's ``price`` at 1 and the loser's at 0, while every open
+        market had ``winner: false`` on both tokens and a live price on
+        each. So ``winner`` is the discriminator and ``price`` is only
+        a settlement value once a winner exists.
+
+        Two winners on a binary market is a contradictory document.
+        Neither one is chosen and both are named, because guessing which
+        outcome settled would put an invented result on a tape that
+        exists to be trusted. The check that follows is not fatal to a
+        capture; it counts as a failed lifecycle read.
+
+        Polymarket publishes no settlement timestamp, so ``ts`` is None
+        and the daemon stamps the row when it observed the change.
+        """
+        tokens = resolved.raw.get("tokens")
+        if not isinstance(tokens, list):
+            return None
+        winners = [t for t in tokens if isinstance(t, dict) and t.get("winner")]
+        if not winners:
+            return None
+        if len(winners) > 1:
+            names = ", ".join(repr(str(t.get("outcome") or "")) for t in winners)
+            raise LiveError(
+                f"polymarket: market {resolved.market_id!r} marks {len(winners)} outcomes as "
+                f"the winner ({names}); a binary market has one, so no resolution is recorded"
+            )
+        winner = winners[0]
+        name = str(winner.get("outcome") or "").strip()
+        if not name:
+            raise LiveError(
+                f"polymarket: market {resolved.market_id!r} has a winning token with no "
+                f"outcome name, so the winner cannot be named on the tape"
+            )
+        return MarketResolution(
+            outcome=name,
+            settlement=_price(
+                winner.get("price"), context=f"polymarket settlement {resolved.market_id}"
+            ),
         )
 
     def book(self, market_id: str) -> BookQuote:

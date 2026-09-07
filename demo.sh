@@ -32,12 +32,15 @@ print(
 )
 EOF
 
-# A market that closes while the capture is running. The venue is a
-# scripted source rather than a real one so this part runs offline in
-# CI, but the daemon, the tape, and the status rows are the shipped
-# ones: only the answers to describe() are stand-ins.
+# A market that closes and then settles while the capture is running.
+# The venue is a scripted source rather than a real one so this part
+# runs offline in CI, but the daemon, the tape, the status rows and the
+# resolution row are the shipped ones: only the answers to describe()
+# are stand-ins. The two events are deliberately separated by one check,
+# because that is how a real venue behaves: a market stops trading
+# first and is settled afterwards.
 echo
-echo "\$ python: a capture across a market's close"
+echo "\$ python: a capture across a market's close and its settlement"
 uv run python - <<'EOF'
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -45,13 +48,14 @@ from tempfile import mkdtemp
 from typing import ClassVar
 
 from opentape import Tape
-from opentape.events import MarketStatus
+from opentape.events import MarketStatus, Resolution
 from opentape.live.base import (
     BookLevel,
     BookQuote,
     LiveSource,
     MarketDescription,
     MarketRef,
+    MarketResolution,
 )
 from opentape.live.daemon import CaptureConfig, CaptureDaemon
 
@@ -59,7 +63,7 @@ START = datetime(2026, 9, 7, 15, 20, tzinfo=UTC)
 
 
 class ClosingVenue(LiveSource):
-    """Answers "open" twice, then "closed"."""
+    """Answers "open" twice, then "closed", then "closed" with a winner."""
 
     key: ClassVar[str] = "demo"
     source_tag: ClassVar[str] = "demo-rest-poll"
@@ -73,8 +77,16 @@ class ClosingVenue(LiveSource):
     def describe(self, market_id):
         self.asked += 1
         status = "open" if self.asked <= 2 else "closed"
+        # Closed on the third answer, settled only on the fourth. A
+        # market that has stopped trading has not necessarily settled.
+        resolution = None
+        if self.asked >= 4:
+            resolution = MarketResolution(outcome="YES", settlement=1.0)
         return MarketDescription(
-            market_id="DEMO-CLOSE", title="Will the demo market close?", status=status
+            market_id="DEMO-CLOSE",
+            title="Will the demo market close?",
+            status=status,
+            resolution=resolution,
         )
 
     def book(self, market_id):
@@ -110,7 +122,7 @@ daemon = CaptureDaemon(
         markets=("DEMO-CLOSE",),
         output=out,
         poll_interval=1.0,
-        duration=6.0,
+        duration=8.0,
         status_every=2.0,
     ),
     now=clock.now,
@@ -120,7 +132,13 @@ daemon = CaptureDaemon(
 )
 stats = daemon.run()
 print(f"status changes observed: {stats.status_changes}")
+print(f"settlements observed:    {stats.resolutions}")
 for event in Tape.read(stats.files[0]).replay(speed="max"):
     if isinstance(event, MarketStatus):
         print(f"  seq={event.seq}  {event.ts:%H:%M:%S}  status={event.status}")
+    elif isinstance(event, Resolution):
+        print(
+            f"  seq={event.seq}  {event.ts:%H:%M:%S}  "
+            f"resolution={event.outcome} settles at {event.settlement:g}"
+        )
 EOF

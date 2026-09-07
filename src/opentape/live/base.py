@@ -33,6 +33,36 @@ class MarketRef:
 
 
 @dataclass(frozen=True, slots=True)
+class MarketResolution:
+    """The venue's published settlement: which outcome won, and what it pays.
+
+    This is deliberately not the same thing as a status of ``closed``.
+    A market stops trading and settles at two different moments, and on
+    Kalshi they are two different documents: a market in status
+    ``closed`` carries ``result: ""`` and no settlement value at all,
+    and only once it reaches ``settled`` or ``finalized`` does a result
+    appear. A source returns ``None`` until the venue actually publishes
+    a winner, so an unresolved market never produces a resolution row.
+
+    ``ts`` is the venue's own settlement time where it publishes one and
+    ``None`` where it does not, exactly as :class:`BookQuote` treats a
+    book timestamp. Kalshi publishes ``settlement_ts``; Polymarket
+    publishes nothing comparable, so a Polymarket resolution is stamped
+    with the moment the capture observed it, which is an upper bound
+    rather than the moment the venue decided.
+    """
+
+    #: The winning outcome, spelled the way the venue spells it, so it
+    #: can be compared against the market row's ``outcomes``.
+    outcome: str
+    #: What the WINNING outcome pays. For an ordinary binary market this
+    #: is 1.0. It is the winner's value and not the YES side's value;
+    #: see the note in ``events.Resolution``.
+    settlement: float
+    ts: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class MarketDescription:
     """What a source knows about a market before any polling starts."""
 
@@ -40,6 +70,10 @@ class MarketDescription:
     title: str
     status: str
     outcomes: tuple[str, ...] = ("YES", "NO")
+    #: The venue's published settlement, or None while the market has
+    #: not resolved. Read from the same document as ``status``, so
+    #: watching for a resolution costs no extra request.
+    resolution: MarketResolution | None = None
 
 
 @dataclass(frozen=True, slots=True)

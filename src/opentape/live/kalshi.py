@@ -20,7 +20,10 @@ Canonical mapping, matching the ``kalshi-style`` file adapter:
 
 The orderbook response carries no timestamp, so book events captured
 from Kalshi are stamped with local capture time. Trades carry
-``created_time`` and keep it.
+``created_time`` and keep it, and a settlement carries ``settlement_ts``
+and keeps it, which makes a resolution row the one lifecycle row on a
+Kalshi tape that is stamped with the venue's own clock rather than the
+capture's.
 """
 
 from __future__ import annotations
@@ -36,6 +39,7 @@ from opentape.live.base import (
     LiveSource,
     MarketDescription,
     MarketRef,
+    MarketResolution,
     TradeTick,
 )
 from opentape.live.http import Fetcher
@@ -155,6 +159,7 @@ class KalshiLive(LiveSource):
             market_id=str(market.get("ticker") or market_id),
             title=f"{title} {detail}".strip() if detail else title,
             status=_STATUS_MAP.get(raw_status, raw_status or "unknown"),
+            resolution=_resolution(market, market_id),
         )
 
     def book(self, market_id: str) -> BookQuote:
@@ -212,6 +217,52 @@ class KalshiLive(LiveSource):
             )
         ticks.sort(key=lambda t: t.ts)
         return ticks
+
+
+def _resolution(market: dict[str, Any], market_id: str) -> MarketResolution | None:
+    """Read Kalshi's settlement, or None while the market has not settled.
+
+    ``result`` is the discriminator and it is empty until the market
+    settles, which was checked against the live API rather than assumed:
+    a market in status ``closed`` answers ``result: ""`` with
+    ``settlement_value_dollars`` and ``settlement_ts`` both absent,
+    while a ``settled`` or ``finalized`` one answers ``result: "yes"``
+    or ``"no"`` with both fields present.
+
+    ``settlement_value_dollars`` is the YES contract's value, so it is
+    ``"0.0000"`` on a market that resolved NO. The event records what
+    the WINNER pays, which is the complement in that case. Taking the
+    field at face value would write "NO won and pays 0.00" onto the
+    tape, which is the opposite of what happened.
+    """
+    result = str(market.get("result") or "").strip().lower()
+    if not result:
+        return None
+    if result not in ("yes", "no"):
+        raise LiveError(
+            f"kalshi: market {market_id!r} settled to result {result!r}, which is neither "
+            f"'yes' nor 'no'; schema v1 describes binary markets, so this cannot be "
+            f"recorded as a resolution without guessing what it means"
+        )
+    raw_value = market.get("settlement_value_dollars")
+    if raw_value is None:
+        raw_value = market.get("settlement_value")
+    if raw_value is None:
+        # A result with no value is a half-published settlement. Say
+        # nothing rather than invent 1.0; the next check will see the
+        # complete document.
+        raise LiveError(
+            f"kalshi: market {market_id!r} reports result {result!r} but publishes no "
+            f"settlement value yet, so its settlement is not recorded"
+        )
+    yes_value = _price(raw_value, context=f"kalshi settlement {market_id}")
+    settlement = yes_value if result == "yes" else round(1.0 - yes_value, PRICE_DECIMALS)
+    raw_ts = market.get("settlement_ts")
+    return MarketResolution(
+        outcome="YES" if result == "yes" else "NO",
+        settlement=settlement,
+        ts=parse_ts(raw_ts, context=f"kalshi settlement_ts {market_id}") if raw_ts else None,
+    )
 
 
 def _two_sided(market: dict[str, Any]) -> bool:

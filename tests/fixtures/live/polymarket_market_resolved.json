@@ -1,0 +1,55 @@
+{
+  "enable_order_book": false,
+  "active": true,
+  "closed": true,
+  "archived": false,
+  "accepting_orders": false,
+  "accepting_order_timestamp": "2026-07-31T19:09:57Z",
+  "minimum_order_size": 5,
+  "minimum_tick_size": 0.001,
+  "condition_id": "0x7ba05d259657e856a103b43c85357dcd2d5446fc056230b0e4eb20420af076d6",
+  "question_id": "0x8e650b5d2265ba2ef3a9f2b52567155ba0e973b412ff29d2a44bd8a1a4f6fe0b",
+  "question": "Will Andrew Bailey be the next Attorney General?",
+  "market_slug": "will-andrew-bailey-be-the-next-attorney-general-20260731142118983",
+  "end_date_iso": "2029-01-19T00:00:00Z",
+  "game_start_time": null,
+  "seconds_delay": 0,
+  "fpmm": "",
+  "maker_base_fee": 1000,
+  "taker_base_fee": 1000,
+  "notifications_enabled": true,
+  "neg_risk": true,
+  "neg_risk_market_id": "0x8e650b5d2265ba2ef3a9f2b52567155ba0e973b412ff29d2a44bd8a1a4f6fe00",
+  "neg_risk_request_id": "0x05e96c7836da35ad070950ad086bc6cd5d3d7cb59bf363ea151cfb205d6f329b",
+  "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/will-donald-trump-announce-person-h-as-the-next-united-states-attorney-general-by-june-30-dGlITR7UXykf.jpg",
+  "image": "https://polymarket-upload.s3.us-east-2.amazonaws.com/will-donald-trump-announce-person-h-as-the-next-united-states-attorney-general-by-june-30-dGlITR7UXykf.jpg",
+  "rewards": {
+    "rates": null,
+    "min_size": 20,
+    "max_spread": 4.5
+  },
+  "is_50_50_outcome": false,
+  "tokens": [
+    {
+      "token_id": "104724011435282767010255443219369824983743637512947884356127488519927851482313",
+      "outcome": "Yes",
+      "price": 0,
+      "winner": false
+    },
+    {
+      "token_id": "68334702258659129580925274523346942282277587207664190338420276864684873277615",
+      "outcome": "No",
+      "price": 1,
+      "winner": true
+    }
+  ],
+  "tags": [
+    "Politics",
+    "Trump",
+    "Trump Cabinet",
+    "bondi",
+    "Todd Blanche",
+    "AG",
+    "Zeldin"
+  ]
+}

@@ -27,6 +27,14 @@ polled tape can be trusted to say:
   ``market_status`` row at the point the change was observed, and a
   segment written after that point opens with the new status rather
   than the one the capture started with.
+- A market that SETTLES while the capture is running gets a
+  ``resolution`` row naming the winning outcome. That is a different
+  fact from ``market_status: closed``, which only says the market
+  stopped trading, and the two arrive at different times: on Kalshi a
+  closed market publishes an empty result and no settlement value at
+  all until it reaches ``settled``. The settlement is read from the
+  same document as the status, so watching for it costs no extra
+  request.
 """
 
 from __future__ import annotations
@@ -47,9 +55,16 @@ from opentape.events import (
     Market,
     MarketStatus,
     OrderBookSnapshot,
+    Resolution,
     Trade,
 )
-from opentape.live.base import BookTracker, LiveSource, MarketDescription, TradeDeduper
+from opentape.live.base import (
+    BookTracker,
+    LiveSource,
+    MarketDescription,
+    MarketResolution,
+    TradeDeduper,
+)
 from opentape.live.stream import (
     BookMirror,
     StreamBook,
@@ -115,6 +130,10 @@ class TapeStats:
     #: Lifecycle transitions observed while capturing, excluding the
     #: opening status every tape carries anyway.
     status_changes: int = 0
+    #: Settlements observed while capturing. A market already settled
+    #: when the capture began is not counted: its resolution is a
+    #: segment header, not something this capture watched happen.
+    resolutions: int = 0
     #: Lifecycle re-reads that raised. These are counted rather than
     #: fatal; see :meth:`_TapeCapture._recheck_status`.
     status_check_failures: int = 0
@@ -160,6 +179,12 @@ class _TapeCapture:
         #: :attr:`_descriptions` by one flush on purpose; see
         #: :meth:`_prepare_segment`.
         self._segment_status: dict[str, str] = {}
+        #: The settlement each market had already published when the
+        #: CURRENT segment began, on exactly the same lagging rule as
+        #: :attr:`_segment_status`, so a segment that watched a market
+        #: settle carries the observed row in its body and the segment
+        #: after it opens with a resolution header.
+        self._segment_resolution: dict[str, MarketResolution] = {}
         #: Canonical market id back to the spelling the user typed,
         #: which is the one a later ``describe()`` is given. A venue can
         #: accept several spellings and only the user's is known to
@@ -177,6 +202,11 @@ class _TapeCapture:
         """Record a market's opening description, before anything is captured."""
         self._descriptions[described.market_id] = described
         self._segment_status[described.market_id] = described.status
+        if described.resolution is not None:
+            # Already settled before this capture began. That is a
+            # header, not an observation: nothing about it happened
+            # while the tape was being written.
+            self._segment_resolution[described.market_id] = described.resolution
         self._requested[described.market_id] = requested
         self._log(f"tracking {described.market_id} ({described.status}): {described.title}")
 
@@ -205,6 +235,55 @@ class _TapeCapture:
         self._log(f"{market_id} changed status: {held.status} -> {status}")
         return True
 
+    def _observe_resolution(
+        self, market_id: str, resolution: MarketResolution | None, ts: datetime
+    ) -> bool:
+        """Record a settlement, emitting a row only the first time it is seen.
+
+        A resolution is final, so unlike a status it cannot flap and it
+        is written exactly once per market per capture. A venue that
+        keeps reporting the same winner on every later check produces no
+        further rows.
+
+        The row is stamped with the venue's own settlement time when the
+        venue publishes one, and with the observation time when it does
+        not. Kalshi publishes ``settlement_ts``; Polymarket publishes
+        nothing comparable. This is the same rule the book already uses
+        for :class:`~opentape.live.base.BookQuote.ts`, and it is the
+        reason a resolution row can be more precise than the
+        ``market_status`` row that precedes it, which is always an
+        upper bound set by ``--status-every``.
+
+        A venue that changes its mind after publishing a winner is NOT
+        written a second time. That is a deliberate limitation rather
+        than an oversight: a second row would be indistinguishable from
+        the ordinary case in a tape sorted by time, and a settlement
+        that moves is rare enough to be worth handling by re-reading the
+        venue rather than by trusting a capture that happened to be
+        running.
+        """
+        if resolution is None:
+            return False
+        held = self._descriptions.get(market_id)
+        if held is None or held.resolution is not None:
+            return False
+        self._descriptions[market_id] = replace(held, resolution=resolution)
+        self._emit(
+            Resolution(
+                seq=0,
+                ts=resolution.ts or ts,
+                market_id=market_id,
+                source=self._source_tag,
+                outcome=resolution.outcome,
+                settlement=resolution.settlement,
+            )
+        )
+        self.stats.resolutions += 1
+        self._log(
+            f"{market_id} resolved: {resolution.outcome} settles at {resolution.settlement:g}"
+        )
+        return True
+
     def _recheck_status(self, describe: Callable[[str], MarketDescription], ts: datetime) -> None:
         """Re-read every tracked market's status and record any change.
 
@@ -215,6 +294,14 @@ class _TapeCapture:
         arriving perfectly well. An unknown status is also not a
         change: writing one down because a request timed out would put
         a claim on the tape that nothing observed.
+
+        The status and the settlement come from ONE document, so a
+        source that refuses to read a contradictory settlement costs
+        this check its status update as well. That is the intended
+        trade: the refusal is counted and named, the next check picks
+        the status up, and neither an invented winner nor a status
+        blessed by a document the source could not fully parse reaches
+        the tape.
         """
         for canonical in list(self._descriptions):
             try:
@@ -227,7 +314,13 @@ class _TapeCapture:
             # whatever this call resolved to. The canonical spelling was
             # decided once at the start; a tape whose rows disagree
             # about the identifier is not queryable by market.
+            #
+            # Status first, then settlement, because that is the order
+            # they happen in: a market stops trading and is settled
+            # afterwards. When one check sees both at once, the tape
+            # still reads forward correctly.
             self._observe_status(canonical, described.status, ts)
+            self._observe_resolution(canonical, described.resolution, ts)
 
     def _emit(self, event: Event) -> None:
         """Buffer an observed event, in the order it was observed."""
@@ -267,6 +360,17 @@ class _TapeCapture:
         segment forward should see. The next segment then opens with
         ``closed``. Status rows observed during the capture stay in the
         body for exactly this reason: they are events, not headers.
+
+        A settlement follows the identical rule, one level further on.
+        A segment written while the market had already settled opens
+        with a ``resolution`` header, so a reader who picks up a late
+        segment on its own learns how the market ended without having
+        to find the segment that watched it happen. The segment that
+        watched it carries the observed row in its body instead. A
+        header resolution is dated to the start of the segment's
+        coverage like every other header, which means it deliberately
+        does NOT carry the venue's settlement timestamp; the observed
+        row in the body is the one that does.
 
         Those rows are then dated to the earliest event in the segment,
         rather than to the moment the daemon asked the venue what the
@@ -315,11 +419,25 @@ class _TapeCapture:
                     status=self._segment_status.get(market_id, described.status),
                 )
             )
+            settled = self._segment_resolution.get(market_id)
+            if settled is not None:
+                headers.append(
+                    Resolution(
+                        seq=0,
+                        ts=ts,
+                        market_id=market_id,
+                        source=self._source_tag,
+                        outcome=settled.outcome,
+                        settlement=settled.settlement,
+                    )
+                )
         # Whatever the markets are now is what the NEXT segment opens
         # with, so this is advanced once the segment it describes has
         # been built and never while events are still being buffered.
         for market_id, described in self._descriptions.items():
             self._segment_status[market_id] = described.status
+            if described.resolution is not None:
+                self._segment_resolution[market_id] = described.resolution
         return [replace(event, seq=i) for i, event in enumerate(headers + body)]
 
     def _flush(self) -> None:

@@ -200,6 +200,61 @@ the transition in its body, and every later segment opens with
 
 `--no-status-check` restores the old behaviour of asking exactly once.
 
+### A market that settles while you are recording it
+
+`market_status: closed` says a market stopped trading. It does not say
+how it settled, and those are two different facts that arrive at two
+different times. When the venue publishes a winner, the capture writes
+a `resolution` row naming the winning outcome and what it pays. This
+comes out of the same document the status check already reads, so
+watching for it costs no extra request and `--status-every` paces both.
+
+Continuing the same offline part of `./demo.sh`, with the scripted
+venue closing on one check and settling on the next:
+
+```
+$ python: a capture across a market's close and its settlement
+tracking DEMO-CLOSE (open): Will the demo market close?
+DEMO-CLOSE changed status: open -> closed
+DEMO-CLOSE resolved: YES settles at 1
+wrote /tmp/.../closing.parquet: 12 events
+status changes observed: 1
+settlements observed:    1
+  seq=1  15:20:00  status=open
+  seq=7  15:20:04  status=closed
+  seq=10  15:20:06  resolution=YES settles at 1
+```
+
+**The gap between those two rows is the reason this exists, and it is
+not a demo artifact.** A Kalshi market advertises
+`settlement_timer_seconds: 5`, and one recorded for the test suite
+(`tests/fixtures/live/kalshi_market_closed.json`) had closed at
+17:30 UTC and was still answering `result: ""` with no settlement value
+when it was captured 28 minutes later. A tape that only recorded the
+close would say nothing about how that market ended.
+
+Three details worth knowing before reading a `resolution` row:
+
+- **`outcome` names the winner, not the YES side.** It is the one place
+  in the schema where that column is not the string `YES`. What YES
+  settled at is recoverable from the tape alone: the market row lists
+  `outcomes` with the YES side first, so YES settled at `settlement`
+  when `outcome` is `outcomes[0]` and at `1 - settlement` otherwise.
+- **Kalshi's row carries the venue's own settlement time.** It
+  publishes `settlement_ts`, so unlike a status row the timestamp is
+  not merely an upper bound set by `--status-every`. Polymarket
+  publishes nothing comparable, so its resolution rows are stamped when
+  the capture observed them.
+- **Rotation follows the same rule the status header does.** The
+  segment that watched the settlement carries the observed row in its
+  body; every later segment opens with a `resolution` header, so a
+  reader who picks up a late segment alone still learns how the market
+  ended.
+
+A settlement is written once per market per capture. A venue that
+changes its mind after publishing a winner is not written a second
+time; see ROADMAP.md.
+
 ### Streaming instead of polling
 
 `--transport websocket` subscribes to the venue's change stream, so a
@@ -302,6 +357,11 @@ rather than glossed over.
 - **Kalshi book events carry local capture time.** Its orderbook
   endpoint publishes no timestamp of its own. Polymarket's does, and
   that one is used.
+- **A settlement is recorded only once the venue publishes a winner.**
+  A market that has closed but not yet settled writes a `market_status`
+  row and nothing else. Neither venue is asked to guess, and a
+  contradictory document (two winning outcomes on a binary market) is
+  refused by name rather than resolved to one of them.
 
 ## Why?
 
@@ -482,6 +542,19 @@ flipped. Polymarket's binary markets are not all spelled Yes/No, so a
 market like `btc-updown-5m-...` maps Up to the YES side and records
 `("Up", "Down")` on the tape's market row.
 
+The two venues publish a settlement differently, and `describe()`
+normalizes both into the same `resolution` row:
+
+| | Kalshi | Polymarket |
+| --- | --- | --- |
+| Settled when | `result` is `yes` or `no` | exactly one outcome token has `winner: true` |
+| Settlement value | `settlement_value_dollars`, which is the **YES** side's value, complemented when NO won | the winning token's own `price` |
+| Venue settlement time | `settlement_ts`, kept | not published, so the row is stamped when observed |
+
+Kalshi's field being the YES value matters: on a market that resolved
+NO it reads `0.0000`, and copying it across would write "NO won and
+pays 0.00" onto the tape.
+
 ## Architecture
 
 ```
@@ -566,7 +639,21 @@ windows with heavier trading, and two resolutions.
 - A status change is caught no sooner than the next `--status-every`,
   so the row's time is an upper bound on when the change happened, not
   the moment it did. Shortening the interval costs one request per
-  market per check on a different endpoint than the book.
+  market per check on a different endpoint than the book. A Kalshi
+  `resolution` row is the exception, because that venue publishes its
+  own `settlement_ts`.
+- **A settlement is recorded once and never revised.** A venue that
+  publishes a winner and later changes it leaves the first row on the
+  tape and nothing else, because a second row would be
+  indistinguishable from an ordinary settlement in a tape sorted by
+  time. See ROADMAP.md.
+- **A settlement is only seen if the capture is still running when the
+  venue publishes it, and that wait is not bounded by the close.** A
+  Kalshi market recorded for the test suite closed at 17:30 UTC and was
+  still unsettled 28 minutes later, despite advertising
+  `settlement_timer_seconds: 5`. Polymarket settles through UMA and is
+  slower still, so a resolution row for it usually belongs to a
+  different capture than the one that recorded the trading.
 - Polymarket's public trades endpoint publishes no per-fill id, so
   deduplication uses a composite key (transaction, taker, token, size,
   price). Two identical fills by one taker in one transaction would
