@@ -233,6 +233,16 @@ def _report_status(stats: TapeStats) -> None:
             f"{stats.status_check_failures:,} status check(s) failed; the tape's status "
             f"rows are as of the last check that succeeded"
         )
+    if stats.retired:
+        print(
+            f"{stats.retired:,} market(s) had closed and settled and were dropped from "
+            f"the capture, so nothing further was requested for them"
+        )
+    if stats.stopped_early:
+        print(
+            "the capture ended before its duration because every market it tracked had "
+            "closed and settled"
+        )
 
 
 def _status_every(args: argparse.Namespace) -> float | None:
@@ -251,6 +261,26 @@ def _status_every(args: argparse.Namespace) -> float | None:
     return parse_duration(args.status_every or "30s", flag="--status-every")
 
 
+def _warn_if_settled_check_is_blind(args: argparse.Namespace) -> None:
+    """Say so when --stop-when-settled has only one chance to fire.
+
+    The two flags are not a contradiction, so this is a note rather than
+    an error: with the lifecycle re-read off, the market's description
+    is read exactly once, when the capture opens. A market that was
+    already settled then is still noticed and the capture still ends
+    immediately, which is a real use ("do not spend an hour on a market
+    that is over"). What cannot happen is noticing a settlement that
+    arrives DURING the capture, and a user who asked for one deserves to
+    be told that rather than to watch a full duration elapse.
+    """
+    if args.stop_when_settled and args.no_status_check:
+        print(
+            "note: --no-status-check means the lifecycle is read only when the capture "
+            "opens, so --stop-when-settled can only act on a market that had already "
+            "settled by then, not on one that settles while recording"
+        )
+
+
 def _cmd_capture(args: argparse.Namespace) -> int:
     if args.transport == "websocket":
         return _cmd_capture_stream(args)
@@ -264,11 +294,15 @@ def _cmd_capture(args: argparse.Namespace) -> int:
         resnapshot_every=args.snapshot_every,
         backfill=args.backfill,
         status_every=_status_every(args),
+        stop_when_settled=args.stop_when_settled,
     )
     log = (lambda msg: None) if args.quiet else (lambda msg: print(msg, flush=True))
     if not args.quiet:
         span = f" for {args.duration}" if args.duration else " until interrupted"
+        if args.stop_when_settled:
+            span += ", or until every market has closed and settled"
         print(f"capturing {len(config.markets)} market(s) from {args.venue}{span}")
+        _warn_if_settled_check_is_blind(args)
         print(
             f"polling every {args.poll or '2s'}; "
             f"press Ctrl-C to stop and write what has been captured"
@@ -283,11 +317,30 @@ def _cmd_capture(args: argparse.Namespace) -> int:
     )
     _report_status(stats)
     if not stats.files:
-        print("no events were captured, so no tape was written")
-        return 1
+        return _no_tape(stats)
     for path in stats.files:
         print(f"wrote {path}")
     return 0
+
+
+def _no_tape(stats: TapeStats) -> int:
+    """Report a capture that wrote nothing, and decide whether that is a failure.
+
+    An empty capture is normally a failure: the user asked for a tape
+    and has none, and the exit code should say so. Ending because every
+    market had already settled is the one case where it is not, because
+    it is what the flag was asked to do and there was nothing left to
+    record. Reporting that as a failure would make ``--stop-when-settled``
+    exit nonzero for working exactly as documented.
+    """
+    if stats.stopped_early:
+        print(
+            "every market named had already closed and settled, so there was nothing "
+            "left to record and no tape was written"
+        )
+        return 0
+    print("no events were captured, so no tape was written")
+    return 1
 
 
 def _cmd_capture_stream(args: argparse.Namespace) -> int:
@@ -311,11 +364,15 @@ def _cmd_capture_stream(args: argparse.Namespace) -> int:
         duration=parse_duration(args.duration, flag="--duration") if args.duration else None,
         rotate_after=parse_duration(args.rotate, flag="--rotate") if args.rotate else None,
         status_every=_status_every(args),
+        stop_when_settled=args.stop_when_settled,
     )
     log = (lambda msg: None) if args.quiet else (lambda msg: print(msg, flush=True))
     if not args.quiet:
         span = f" for {args.duration}" if args.duration else " until interrupted"
+        if args.stop_when_settled:
+            span += ", or until every market has closed and settled"
         print(f"streaming {len(config.markets)} market(s) from {args.venue}{span}")
+        _warn_if_settled_check_is_blind(args)
         print(f"connecting to {source.stream_url()}; press Ctrl-C to stop and write the tape")
     stats = StreamDaemon(source, config, log=log).run()
     checked = (
@@ -337,8 +394,7 @@ def _cmd_capture_stream(args: argparse.Namespace) -> int:
             f"for their market and were dropped rather than applied to an empty book"
         )
     if not stats.files:
-        print("no events were captured, so no tape was written")
-        return 1
+        return _no_tape(stats)
     for path in stats.files:
         print(f"wrote {path}")
     return 0
@@ -483,6 +539,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="read each market's lifecycle once at the start and never again. The tape then "
         "states the status the capture opened with, whatever happened after, and no "
         "settlement that happens during the capture is recorded",
+    )
+    p_capture.add_argument(
+        "--stop-when-settled",
+        action="store_true",
+        help="stop asking the venue about a market once it reports BOTH closed and settled, "
+        "and end the capture when every market has, rather than polling a book that cannot "
+        "move again. Off by default, so a capture runs for its full --duration unless asked "
+        "otherwise. Both halves are required because a status can flap and a settlement "
+        "cannot. On --transport websocket this narrows the lifecycle re-read only, since a "
+        "subscription cannot drop one market without dropping the connection",
     )
     p_capture.add_argument(
         "--timeout", type=float, default=10.0, help="per-request timeout in seconds"

@@ -35,6 +35,11 @@ polled tape can be trusted to say:
   all until it reaches ``settled``. The settlement is read from the
   same document as the status, so watching for it costs no extra
   request.
+- A market that has both closed and settled will not move again, so
+  ``stop_when_settled`` stops asking the venue about it and ends the
+  capture once every market it tracks is in that state. It is off by
+  default: a capture that ends before the ``--duration`` the user asked
+  for is a surprise, and it should be one the user requested.
 """
 
 from __future__ import annotations
@@ -116,6 +121,10 @@ class CaptureConfig:
     #: costs an extra request per market and a market's status changes
     #: on a different timescale than its book.
     status_every: float | None = 30.0
+    #: Drop a market from the capture once the venue reports it closed
+    #: AND settled, and end the capture when every market has been
+    #: dropped. Off by default; see the module docstring.
+    stop_when_settled: bool = False
 
 
 @dataclass(slots=True)
@@ -137,6 +146,15 @@ class TapeStats:
     #: Lifecycle re-reads that raised. These are counted rather than
     #: fatal; see :meth:`_TapeCapture._recheck_status`.
     status_check_failures: int = 0
+    #: Markets dropped from the capture because they had closed and
+    #: settled. Always zero unless the caller asked for it, since
+    #: retirement only happens under ``stop_when_settled``.
+    retired: int = 0
+    #: Whether the capture ended because every market it tracked
+    #: finished, rather than because the duration elapsed or the user
+    #: interrupted it. This is the difference between a short tape that
+    #: covers everything there was and a short tape that was cut off.
+    stopped_early: bool = False
 
 
 @dataclass(slots=True)
@@ -164,11 +182,13 @@ class _TapeCapture:
         rotate_after: float | None,
         source_tag: str,
         stats: TapeStats,
+        stop_when_settled: bool = False,
         log: Callable[[str], None] | None = None,
     ) -> None:
         self._output = output
         self._rotate_after = rotate_after
         self._source_tag = source_tag
+        self._stop_when_settled = stop_when_settled
         self._log = log or (lambda _msg: None)
         self._buffer: list[Event] = []
         self._segment = 0
@@ -190,6 +210,12 @@ class _TapeCapture:
         #: accept several spellings and only the user's is known to
         #: work, since it is the one that resolved at the start.
         self._requested: dict[str, str] = {}
+        #: Canonical ids the capture has stopped asking the venue about
+        #: because they closed and settled. A retired market keeps its
+        #: entry in :attr:`_descriptions`, so its header rows and its
+        #: final status and resolution still reach every later segment;
+        #: retirement stops requests, not bookkeeping.
+        self._retired: set[str] = set()
         self.stats = stats
 
     def stop(self) -> None:
@@ -303,7 +329,7 @@ class _TapeCapture:
         blessed by a document the source could not fully parse reaches
         the tape.
         """
-        for canonical in list(self._descriptions):
+        for canonical in self._live_markets():
             try:
                 described = describe(self._requested.get(canonical, canonical))
             except LiveError as exc:
@@ -321,6 +347,47 @@ class _TapeCapture:
             # still reads forward correctly.
             self._observe_status(canonical, described.status, ts)
             self._observe_resolution(canonical, described.resolution, ts)
+
+    # -- retirement --------------------------------------------------------
+
+    def _live_markets(self) -> list[str]:
+        """Canonical ids the capture is still asking the venue about."""
+        return [market_id for market_id in self._descriptions if market_id not in self._retired]
+
+    def _retire_finished(self) -> list[str]:
+        """Retire every tracked market the venue reports closed and settled.
+
+        A market in that state will not trade again, so every request
+        spent on it buys a book that cannot move and a lifecycle that
+        cannot change. Retiring it is the only thing here that reduces
+        what a capture records, which is why it happens only when the
+        caller asked for it and why the count reaches the summary line.
+
+        Retirement reads the state the daemon already holds rather than
+        asking the venue anything, so it is free to call on every pass.
+        It is also one-way: nothing un-retires a market, because the
+        resolution that qualified it cannot be revised on this tape
+        anyway.
+
+        Returns the ids retired by THIS call, so a caller can log a
+        transition once rather than restating it on every pass.
+        """
+        if not self._stop_when_settled:
+            return []
+        newly = [
+            market_id
+            for market_id in self._live_markets()
+            if self._descriptions[market_id].finished
+        ]
+        for market_id in newly:
+            self._retired.add(market_id)
+            self.stats.retired += 1
+            self._log(f"{market_id} has closed and settled, so it will not be asked about again")
+        return newly
+
+    def _finished(self) -> bool:
+        """Whether every tracked market has been retired."""
+        return bool(self._descriptions) and not self._live_markets()
 
     def _emit(self, event: Event) -> None:
         """Buffer an observed event, in the order it was observed."""
@@ -479,6 +546,7 @@ class CaptureDaemon(_TapeCapture):
             rotate_after=config.rotate_after,
             source_tag=source.source_tag,
             stats=CaptureStats(),
+            stop_when_settled=config.stop_when_settled,
             log=log,
         )
         self.source = source
@@ -541,6 +609,19 @@ class CaptureDaemon(_TapeCapture):
                     self._recheck_status(self.source.describe, self._now())
                     last_status_check = now
 
+                # After the poll rather than before it, so a market that
+                # was already settled when the capture opened still gets
+                # one poll. That poll is what makes the tape non-empty:
+                # it records the final book, under a header that already
+                # carries the status and the winning outcome, so asking
+                # for a capture of a market that is over produces a
+                # picture of how it ended rather than no file at all.
+                self._retire_finished()
+                if self._finished():
+                    self.stats.stopped_early = True
+                    self._log("every market has closed and settled, so the capture is done")
+                    break
+
                 if self.config.rotate_after and now - last_rotation >= self.config.rotate_after:
                     self._flush()
                     last_rotation = now
@@ -576,9 +657,19 @@ class CaptureDaemon(_TapeCapture):
             self._track(described, market_id)
 
     def _poll_once(self) -> list[str]:
-        """Poll every market once. Returns the errors, one per failed market."""
+        """Poll every live market once. Returns the errors, one per failed market.
+
+        "Live" and not "every market the user named", because retirement
+        narrows the set. The failure count is compared against the same
+        narrowed set for the same reason: with three markets of which
+        two have settled, comparing against three would mean the
+        remaining one could fail forever without ever reaching
+        ``max_consecutive_failures``, which is precisely the case the
+        limit exists for.
+        """
         errors: list[str] = []
-        for market_id in self.config.markets:
+        live = self._live_requested()
+        for market_id in live:
             try:
                 self._poll_market(market_id)
             except LiveError as exc:
@@ -587,7 +678,19 @@ class CaptureDaemon(_TapeCapture):
                 # deltas against it once the feed comes back.
                 self._resnapshot.add(market_id)
                 self._log(f"poll failed for {market_id}: {exc}")
-        return errors if len(errors) == len(self.config.markets) else []
+        return errors if live and len(errors) == len(live) else []
+
+    def _live_requested(self) -> list[str]:
+        """The user's own spellings of the markets still being polled.
+
+        The poll path works in requested ids and retirement works in
+        canonical ones, so the translation happens here, once.
+        """
+        return [
+            market_id
+            for market_id in self.config.markets
+            if self._canonical.get(market_id, market_id) not in self._retired
+        ]
 
     def _poll_market(self, market_id: str) -> None:
         canonical = self._canonical.get(market_id, market_id)
@@ -659,6 +762,20 @@ class StreamConfig:
     #: the market's lifecycle, so this stays a REST question even on a
     #: streamed capture.
     status_every: float | None = 30.0
+    #: Stop re-reading the lifecycle of a market once the venue reports
+    #: it closed AND settled, and end the capture when every market has
+    #: reached that state. Off by default.
+    #:
+    #: This narrows less than the polling version does, and the reason
+    #: is the transport rather than an omission: a subscription is sent
+    #: once when the connection opens, so dropping one market from a
+    #: live stream would mean tearing the connection down and
+    #: re-subscribing, which discards every mirrored book and puts a gap
+    #: in the tape for the markets that are still trading. What it does
+    #: narrow is the lifecycle re-read, which is a REST request per
+    #: market per check and is the only per-market cost a streamed
+    #: capture pays on an interval.
+    stop_when_settled: bool = False
 
 
 @dataclass(slots=True)
@@ -710,6 +827,7 @@ class StreamDaemon(_TapeCapture):
             rotate_after=config.rotate_after,
             source_tag=source.source_tag,
             stats=StreamStats(),
+            stop_when_settled=config.stop_when_settled,
             log=log,
         )
         self.source = source
@@ -731,6 +849,17 @@ class StreamDaemon(_TapeCapture):
         """Stream until the duration elapses, or until stopped, then flush."""
         with _interrupt_handler(self.stop):
             self._open_markets()
+            # Checked before the connection is opened, unlike the
+            # polling daemon which polls once first. A stream has no
+            # equivalent of that one poll: a snapshot arrives when the
+            # venue chooses to send one, and on a market that settled
+            # hours ago it may never arrive, so connecting would mean
+            # waiting out the whole duration to record nothing.
+            self._retire_finished()
+            if self._finished():
+                self.stats.stopped_early = True
+                self._log("every market has already closed and settled; not connecting")
+                self._stopping = True
             started = self._monotonic()
             last_rotation = started
             self._last_status_check = started
@@ -818,6 +947,15 @@ class StreamDaemon(_TapeCapture):
             ):
                 self._recheck_status(self.source.describe, self._now())
                 self._last_status_check = now
+                # Only after a lifecycle re-read, because on a stream
+                # that is the only thing that can change a market's
+                # description. Calling it on every message would be
+                # correct and would just re-read state nothing touched.
+                self._retire_finished()
+                if self._finished():
+                    self.stats.stopped_early = True
+                    self._log("every market has closed and settled, so the capture is done")
+                    self._stopping = True
             if self.config.rotate_after and now - last_rotation >= self.config.rotate_after:
                 self._flush()
                 last_rotation = now

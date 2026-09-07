@@ -429,3 +429,162 @@ def test_no_status_check_resolves_to_never_asking_again(tmp_path: Path) -> None:
 
     args = build_parser().parse_args(_capture_args(tmp_path, "--no-status-check"))
     assert _status_every(args) is None
+
+
+# -- capture --stop-when-settled -------------------------------------------
+
+
+@pytest.fixture
+def offline_settled(monkeypatch) -> FakeFetcher:
+    """The offline fetcher, but the market has closed and settled.
+
+    This is the recorded `polymarket_market_resolved.json`, a real
+    market that closed with the NO side winning at 1. Its book is the
+    ordinary recorded one, which is what a venue actually serves for a
+    settled market: a book nobody will trade against again.
+    """
+    from tests.test_live_sources import load, polymarket
+
+    resolved = load("polymarket_market_resolved.json")
+    fetch = polymarket(
+        **{
+            "/markets/": resolved,
+            "gamma-api": [{"conditionId": resolved["condition_id"]}],
+        }
+    )[1]
+    monkeypatch.setattr("opentape.cli.HttpFetcher", lambda **kwargs: fetch)
+    return fetch
+
+
+def _settled_args(tmp_path: Path, *extra: str) -> list[str]:
+    return [
+        "capture",
+        "--venue",
+        "polymarket",
+        "--market",
+        "will-andrew-bailey-be-the-next-attorney-general-20260731142118983",
+        "-o",
+        str(tmp_path / "settled.parquet"),
+        "--poll",
+        "1ms",
+        "--duration",
+        "1h",
+        *extra,
+    ]
+
+
+def test_stop_when_settled_ends_a_capture_of_a_finished_market(
+    offline_settled: FakeFetcher, tmp_path: Path, capsys
+) -> None:
+    # The duration asked for is an hour. Without the flag this test
+    # could not exist, which is the point of it.
+    code = main(_settled_args(tmp_path, "--stop-when-settled", "--quiet"))
+    assert code == 0
+    printed = capsys.readouterr().out
+    assert "1 market(s) had closed and settled and were dropped" in printed
+    assert "ended before its duration" in printed
+    # One poll happened before the market was retired, so the tape is a
+    # picture of how the market ended rather than an empty file.
+    assert (tmp_path / "settled.parquet").exists()
+    assert main(["inspect", str(tmp_path / "settled.parquet")]) == 0
+    inspected = capsys.readouterr().out
+    assert "resolution" in inspected
+
+
+def test_a_capture_says_nothing_about_settling_when_nothing_settled(
+    offline: FakeFetcher, tmp_path: Path, capsys
+) -> None:
+    # The summary lines appear only when they have something to report,
+    # the same rule the status lines already follow.
+    assert main(_capture_args(tmp_path, "--stop-when-settled", "--quiet")) == 0
+    printed = capsys.readouterr().out
+    assert "closed and settled" not in printed
+    assert "ended before its duration" not in printed
+
+
+def test_stop_when_settled_is_off_unless_asked_for(tmp_path: Path) -> None:
+    from opentape.cli import build_parser
+
+    assert build_parser().parse_args(_capture_args(tmp_path)).stop_when_settled is False
+    args = build_parser().parse_args(_capture_args(tmp_path, "--stop-when-settled"))
+    assert args.stop_when_settled is True
+
+
+def test_stop_when_settled_with_no_status_check_says_it_is_half_blind(
+    offline_settled: FakeFetcher, tmp_path: Path, capsys
+) -> None:
+    # Not a contradiction, so not an error: the opening read still fires
+    # and this market is still recognised as over. What the user loses
+    # is noticing a settlement that arrives mid-capture, and being told
+    # that beats watching an hour elapse.
+    code = main(_settled_args(tmp_path, "--stop-when-settled", "--no-status-check"))
+    assert code == 0
+    printed = capsys.readouterr().out
+    assert "note: --no-status-check" in printed
+    assert "ended before its duration" in printed
+
+
+def test_the_websocket_transport_accepts_stop_when_settled(tmp_path: Path) -> None:
+    # It applies to both transports, so it must not land in the
+    # polling-only refusal list next to --poll and --snapshot-every.
+    from opentape.cli import build_parser
+
+    args = build_parser().parse_args(_ws_args(tmp_path, "--stop-when-settled"))
+    assert args.transport == "websocket"
+    assert args.stop_when_settled is True
+
+
+def test_a_capture_that_stopped_early_with_nothing_to_record_is_not_a_failure(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    # An empty capture normally exits 1, because the user asked for a
+    # tape and has none. This is the one case where it should not:
+    # the venue no longer serves a book for a market that is over, so
+    # the flag did exactly what it promised and there was nothing left
+    # to write. Exiting 1 there would make working as documented look
+    # like a failure.
+    from opentape.errors import LiveError
+    from tests.test_live_sources import FakeFetcher as Routed
+    from tests.test_live_sources import load
+
+    resolved = load("polymarket_market_resolved.json")
+    fetch = Routed(
+        {
+            "/book": LiveError("polymarket: 404 for a settled market's book"),
+            "data-api": [],
+            "gamma-api": [{"conditionId": resolved["condition_id"]}],
+            "/markets/": resolved,
+        }
+    )
+    monkeypatch.setattr("opentape.cli.HttpFetcher", lambda **kwargs: fetch)
+
+    code = main(_settled_args(tmp_path, "--stop-when-settled", "--quiet"))
+    printed = capsys.readouterr().out
+    assert code == 0
+    assert "nothing left to record and no tape was written" in printed
+    assert not (tmp_path / "settled.parquet").exists()
+
+
+def test_a_capture_that_wrote_nothing_for_any_other_reason_still_fails(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    # The guard for the carve-out above: the ordinary empty capture must
+    # keep exiting 1.
+    from opentape.errors import LiveError
+    from tests.test_live_sources import FakeFetcher as Routed
+    from tests.test_live_sources import load
+
+    market = load("polymarket_market.json")
+    fetch = Routed(
+        {
+            "/book": LiveError("polymarket: the book endpoint is down"),
+            "data-api": [],
+            "gamma-api": [{"conditionId": market["condition_id"]}],
+            "/markets/": market,
+        }
+    )
+    monkeypatch.setattr("opentape.cli.HttpFetcher", lambda **kwargs: fetch)
+
+    code = main(_capture_args(tmp_path, "--stop-when-settled", "--quiet"))
+    assert code == 1
+    assert "no events were captured" in capsys.readouterr().out

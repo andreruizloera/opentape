@@ -38,10 +38,17 @@ upgrade, so it needs a key. What is still open:
   seconds apart, and today every one of those becomes a row. It stays
   off by default, because "what the venue said when asked" is the
   honest raw record and a smoothed one cannot be recovered from it.
-- Stop or narrow a capture once every market it tracks has closed.
-  Today `--status-every` records the close and the loop keeps polling a
-  book that will not move again, which is correct but wasteful on a
-  long `--duration`.
+- Dropping one market from a live subscription. `--stop-when-settled`
+  narrows a polled capture per market, but a streamed one only narrows
+  its lifecycle re-read, because the subscription is sent once when the
+  connection opens and re-sending it means a reconnect that discards
+  every mirrored book. This needs either a venue that accepts an
+  incremental unsubscribe or a way to re-subscribe without putting a
+  gap in the tape for the markets still trading.
+- A retirement rule for a market that closes and never settles. Today
+  `--stop-when-settled` holds the capture open for it, deliberately,
+  because that is the window a settlement arrives in. A capture that
+  wants an upper bound on that wait has no way to say so.
 - Re-settlement: a venue that publishes a winner and later changes it
   writes one row today, the first one. A second row would be
   indistinguishable from an ordinary settlement in a tape sorted by

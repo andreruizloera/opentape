@@ -48,6 +48,10 @@ jobs:
             exit 1
           fi
           grep -q 'contradict each other' /tmp/contradiction.txt
+          # --stop-when-settled must reach BOTH transports. It is the
+          # third flag to apply to both, and the polling-only refusal
+          # list is where the previous two nearly landed by accident.
+          uv run opentape capture --help | grep -q -- '--stop-when-settled'
 
       - name: Offline demo
         run: |
@@ -65,3 +69,10 @@ jobs:
           grep -q 'DEMO-CLOSE resolved: YES settles at 1' /tmp/demo.txt
           grep -q 'settlements observed:    1' /tmp/demo.txt
           grep -q 'seq=10  15:20:06  resolution=YES settles at 1' /tmp/demo.txt
+          # The two runs of the same scripted venue that the README
+          # pastes for --stop-when-settled. The claim is that the flag
+          # and nothing else accounts for the difference, so BOTH lines
+          # are checked: a drift that changed the baseline would
+          # otherwise leave the interesting line looking correct.
+          grep -q 'default: 60 polls, 150 venue requests,   60s of the 60s asked for, stopped_early=False' /tmp/demo.txt
+          grep -q -- '--stop-when-settled:  7 polls,  18 venue requests,    6s of the 60s asked for, stopped_early=True' /tmp/demo.txt

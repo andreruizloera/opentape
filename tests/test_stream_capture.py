@@ -56,6 +56,7 @@ def run(
     log: list[str] | None = None,
     status_every: float | None = None,
     source: PolymarketStream | None = None,
+    stop_when_settled: bool = False,
 ) -> Any:
     config = StreamConfig(
         markets=(MARKET,),
@@ -66,6 +67,7 @@ def run(
         max_reconnects=max_reconnects,
         reconnect_backoff=0.01,
         status_every=status_every,
+        stop_when_settled=stop_when_settled,
     )
     daemon = StreamDaemon(
         source or source_for(server), config, log=(log.append if log is not None else None)
@@ -385,3 +387,85 @@ def test_a_streamed_capture_of_a_closed_market_writes_no_settlement(
     assert stats.resolutions == 0
     rows = list(Tape.read(tmp_path / "tape.parquet").replay(speed="max"))
     assert [e for e in rows if type(e).__name__ == "Resolution"] == []
+
+
+# -- retiring a market on a streamed capture ------------------------------
+
+
+def test_a_streamed_capture_ends_when_its_market_closes_and_settles(
+    tmp_path: Path,
+) -> None:
+    # The duration asked for is ten seconds and the replay is short, so
+    # a capture that runs to its duration and one that stops early are
+    # told apart by the flag rather than by the server running out.
+    market = json.loads((LIVE_FIXTURES / "polymarket_ws_market.json").read_text())
+    logs: list[str] = []
+    with StreamReplayServer(recorded()) as server:
+        source = PolymarketStream(PolymarketLive(SettlingFetcher(market)), url=server.url)
+        stats = run(
+            server,
+            tmp_path,
+            source=source,
+            duration=10.0,
+            status_every=0.01,
+            stop_when_settled=True,
+            log=logs,
+        )
+
+    assert stats.stopped_early is True
+    assert stats.retired == 1
+    assert stats.resolutions == 1
+    assert any("closed and settled" in line for line in logs)
+    # The tape is still a tape: it holds everything the stream published
+    # before the settlement, not just the settlement.
+    assert stats.snapshots >= 1
+
+
+def test_a_streamed_capture_of_a_market_that_is_already_over_does_not_connect(
+    tmp_path: Path,
+) -> None:
+    # A stream has no equivalent of the polling daemon's one poll: a
+    # snapshot arrives when the venue chooses to send one, and on a
+    # market that settled hours ago it may never arrive at all. So the
+    # only honest thing is not to open the connection.
+    market = json.loads((LIVE_FIXTURES / "polymarket_ws_market.json").read_text())
+    tokens = [dict(t) for t in market["tokens"]]
+    tokens[1]["winner"] = True
+    tokens[1]["price"] = 1
+    settled = dict(market, closed=True, tokens=tokens)
+
+    logs: list[str] = []
+    with StreamReplayServer(recorded()) as server:
+        source = PolymarketStream(PolymarketLive(FakeFetcher(settled)), url=server.url)
+        stats = run(
+            server,
+            tmp_path,
+            source=source,
+            duration=10.0,
+            status_every=0.01,
+            stop_when_settled=True,
+            log=logs,
+        )
+        assert server.subscriptions == []
+
+    assert stats.stopped_early is True
+    assert stats.retired == 1
+    assert stats.messages == 0
+    assert stats.files == []
+    assert any("not connecting" in line for line in logs)
+
+
+def test_without_the_flag_a_settled_streamed_market_keeps_its_connection(
+    tmp_path: Path,
+) -> None:
+    # The regression guard for the streamed default, matching the
+    # polling one.
+    market = json.loads((LIVE_FIXTURES / "polymarket_ws_market.json").read_text())
+    with StreamReplayServer(recorded()) as server:
+        source = PolymarketStream(PolymarketLive(SettlingFetcher(market)), url=server.url)
+        stats = run(server, tmp_path, source=source, status_every=0.01)
+        assert len(server.subscriptions) == 1
+
+    assert stats.stopped_early is False
+    assert stats.retired == 0
+    assert stats.resolutions == 1

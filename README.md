@@ -255,6 +255,61 @@ A settlement is written once per market per capture. A venue that
 changes its mind after publishing a winner is not written a second
 time; see ROADMAP.md.
 
+### Stopping once there is nothing left to record
+
+A market that has closed and settled will not trade again, so every
+poll after that point asks the venue for a book that cannot move.
+`--stop-when-settled` stops asking about such a market, and ends the
+capture once every market it tracks has reached that state.
+
+The last part of `./demo.sh` runs the same scripted venue twice, with
+the same sixty-second duration, changing nothing but the flag:
+
+```
+$ python: the same capture with and without --stop-when-settled
+             default: 60 polls, 150 venue requests,   60s of the 60s asked for, stopped_early=False
+ --stop-when-settled:  7 polls,  18 venue requests,    6s of the 60s asked for, stopped_early=True
+```
+
+**Both halves are required, and that is not caution in the abstract.**
+A status can flap: polling Polymarket's `btc-updown-5m-1788794400`
+every 20 seconds on 2026-09-07, the three consecutive reads at
+15:37:02, 15:37:22, and 15:37:42 answered closed, then open, then
+closed. A capture that ended on the first `closed` would have thrown
+away a market that the venue then reported open again. A resolution
+cannot do that, because it is written once and never revised, so
+requiring one is what makes ending a capture safe to hang on this. A
+market that closes and never settles holds the capture open, which is
+the Kalshi case above: closed at 17:30 and still unsettled 28 minutes
+later, in exactly the window a settlement is most likely to arrive.
+
+Four things this does and does not do:
+
+- **It is off by default.** A capture that ends before the `--duration`
+  you asked for is a surprise, and it should be one you requested.
+- **It narrows before it stops.** With several markets, the ones that
+  have settled stop being polled while the rest keep going, so a
+  capture of ten markets does not pay for ten once nine are over.
+- **A market that was already over when the capture opened still gets
+  one poll**, on the polling transport. That poll is what makes the
+  tape worth having: it records the final book under a header that
+  already carries the closed status and the winning outcome, so asking
+  for a capture of a market that is finished gives you a picture of how
+  it ended rather than an empty directory.
+- **On `--transport websocket` it narrows the lifecycle re-read only.**
+  A subscription is sent once when the connection opens, so dropping
+  one market from a live stream would mean tearing the connection down
+  and re-subscribing, which discards every mirrored book and puts a gap
+  in the tape for the markets still trading. The whole capture still
+  ends when every market has settled, and a streamed capture of a
+  market that is already over does not open the connection at all,
+  because a stream has no equivalent of that one poll: a snapshot
+  arrives when the venue chooses to send one, and on a market that
+  settled hours ago it may never arrive.
+
+Nothing about the tape changes. The reason a capture stopped is
+already on it, as the `resolution` rows that ended it.
+
 ### Streaming instead of polling
 
 `--transport websocket` subscribes to the venue's change stream, so a
@@ -476,14 +531,20 @@ opentape capture --venue polymarket --market SLUG -o tape.parquet \
     --status-every 10s             # re-read the lifecycle this often
 opentape capture --venue kalshi --market TICKER -o tape.parquet \
     --no-status-check              # ask once at the start and never again
+opentape capture --venue kalshi --market TICKER -o tape.parquet \
+    --duration 6h --stop-when-settled   # end early once it has settled
 ```
 
 `capture` runs until `--duration` elapses, or until Ctrl-C, which
 stops after the current poll or message and writes what it has rather
-than discarding it. `--poll`, `--snapshot-every`, and `--backfill`
+than discarding it. `--stop-when-settled` adds one more way to end: it
+stops asking about a market once the venue reports it both closed and
+settled, and ends the capture when every market has. `--poll`,
+`--snapshot-every`, and `--backfill`
 belong to `rest-poll` and are refused with a reason under
 `--transport websocket`, where the venue sets the pace and publishes
-its own snapshots. `--status-every` and `--no-status-check` apply to
+its own snapshots. `--status-every`, `--no-status-check`, and
+`--stop-when-settled` apply to
 both, since neither venue publishes lifecycle changes on its stream.
 `--rotate` writes `tape-0001.parquet`, `tape-0002.parquet`, and so on;
 every segment repeats the market definition rows for the markets in
@@ -496,6 +557,14 @@ is never written down as a change. A run whose checks failed prints
 `N status check(s) failed; the tape's status rows are as of the last
 check that succeeded` next to its summary, so the one case where the
 tape's status might be out of date says so.
+
+`--stop-when-settled` with `--no-status-check` is allowed and prints a
+note. It is not a contradiction: the lifecycle is still read once when
+the capture opens, so a market that had already settled by then is
+still recognised and the capture still ends immediately, which is a
+real use. What cannot happen is noticing a settlement that arrives
+during the capture, and a user who asked for one should be told rather
+than left watching the full duration elapse.
 
 ### Adapters
 
@@ -654,6 +723,17 @@ windows with heavier trading, and two resolutions.
   `settlement_timer_seconds: 5`. Polymarket settles through UMA and is
   slower still, so a resolution row for it usually belongs to a
   different capture than the one that recorded the trading.
+- **`--stop-when-settled` will wait forever for a market that closes
+  and never settles.** That is deliberate, since the alternative is
+  ending the capture in exactly the window a settlement arrives in,
+  but it means the flag bounds a capture only for markets that
+  actually resolve. The `--duration` is still the real bound. See
+  ROADMAP.md.
+- **On `--transport websocket`, `--stop-when-settled` narrows only the
+  lifecycle re-read, not the subscription.** A settled market's stream
+  messages keep arriving and keep being written, because dropping one
+  market from a live subscription means a reconnect that discards every
+  mirrored book. Only the whole-capture stop applies there.
 - Polymarket's public trades endpoint publishes no per-fill id, so
   deduplication uses a composite key (transaction, taker, token, size,
   price). Two identical fills by one taker in one transaction would

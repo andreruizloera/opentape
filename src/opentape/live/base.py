@@ -22,6 +22,13 @@ from opentape.events import BookDelta, BookLevel, Event, OrderBookSnapshot
 #: without rounding a level can silently split into two keys.
 PRICE_DECIMALS = 6
 
+#: The canonical status of a market that has stopped trading. Every
+#: venue-specific spelling of that idea maps to it: Kalshi's ``closed``,
+#: ``settled``, ``finalized``, and ``determined`` are all this one word,
+#: which is exactly why a status on its own cannot say whether a winner
+#: has been published.
+CLOSED_STATUS = "closed"
+
 
 @dataclass(frozen=True, slots=True)
 class MarketRef:
@@ -74,6 +81,28 @@ class MarketDescription:
     #: not resolved. Read from the same document as ``status``, so
     #: watching for a resolution costs no extra request.
     resolution: MarketResolution | None = None
+
+    @property
+    def finished(self) -> bool:
+        """Whether the venue reports this market both closed AND settled.
+
+        Both halves are required, and the reason is a live observation
+        rather than caution in the abstract. A status can flap: polling
+        Polymarket's ``btc-updown-5m-1788794400`` every 20 seconds on
+        2026-09-07, the three consecutive reads at 15:37:02, 15:37:22,
+        and 15:37:42 answered closed, then open, then closed. Anything
+        that acts on ``status`` alone therefore acts on a value that can
+        take itself back twenty seconds later.
+
+        A resolution cannot do that. It is written once per capture and
+        never revised (see
+        :meth:`~opentape.live.daemon._TapeCapture._observe_resolution`),
+        so requiring one is what makes this predicate safe to hang an
+        irreversible decision on, such as ending a capture. Requiring
+        the status as well costs nothing and means the two facts have to
+        agree before anything acts on them.
+        """
+        return self.status == CLOSED_STATUS and self.resolution is not None
 
 
 @dataclass(frozen=True, slots=True)

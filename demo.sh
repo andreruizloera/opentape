@@ -142,3 +142,111 @@ for event in Tape.read(stats.files[0]).replay(speed="max"):
             f"resolution={event.outcome} settles at {event.settlement:g}"
         )
 EOF
+
+# The same scripted venue, run twice with the same duration: once with
+# the default, and once with --stop-when-settled. Nothing about the
+# venue differs between the two runs, so the whole difference in
+# requests is the flag. A minute is short for a real capture and is
+# already enough to make the waste visible.
+echo
+echo "\$ python: the same capture with and without --stop-when-settled"
+uv run python - <<'EOF'
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from tempfile import mkdtemp
+from typing import ClassVar
+
+from opentape.live.base import (
+    BookLevel,
+    BookQuote,
+    LiveSource,
+    MarketDescription,
+    MarketRef,
+    MarketResolution,
+)
+from opentape.live.daemon import CaptureConfig, CaptureDaemon
+
+START = datetime(2026, 9, 7, 15, 20, tzinfo=UTC)
+
+
+class SettlingVenue(LiveSource):
+    """Open for two lifecycle reads, then closed, then closed with a winner."""
+
+    key: ClassVar[str] = "demo"
+    source_tag: ClassVar[str] = "demo-rest-poll"
+
+    def __init__(self) -> None:
+        self.lifecycle_reads = 0
+        self.book_reads = 0
+        self.trade_reads = 0
+
+    def list_markets(self, *, limit, search=None):
+        return [MarketRef(market_id="DEMO-SETTLE", title="Demo")]
+
+    def describe(self, market_id):
+        self.lifecycle_reads += 1
+        resolution = None
+        if self.lifecycle_reads >= 4:
+            resolution = MarketResolution(outcome="YES", settlement=1.0)
+        return MarketDescription(
+            market_id="DEMO-SETTLE",
+            title="Will the demo market settle?",
+            status="open" if self.lifecycle_reads <= 2 else "closed",
+            resolution=resolution,
+        )
+
+    def book(self, market_id):
+        self.book_reads += 1
+        return BookQuote(
+            bids=(BookLevel(price=0.61, size=100.0 + self.book_reads),),
+            asks=(BookLevel(price=0.63, size=80.0),),
+        )
+
+    def trades(self, market_id, *, limit=100):
+        self.trade_reads += 1
+        return []
+
+
+class Clock:
+    def __init__(self):
+        self.t = 0.0
+
+    def monotonic(self):
+        return self.t
+
+    def sleep(self, seconds):
+        self.t += seconds
+
+    def now(self):
+        return START + timedelta(seconds=self.t)
+
+
+def capture(stop_when_settled):
+    clock = Clock()
+    venue = SettlingVenue()
+    daemon = CaptureDaemon(
+        venue,
+        CaptureConfig(
+            markets=("DEMO-SETTLE",),
+            output=Path(mkdtemp()) / "settling.parquet",
+            poll_interval=1.0,
+            duration=60.0,
+            status_every=2.0,
+            stop_when_settled=stop_when_settled,
+        ),
+        now=clock.now,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+    stats = daemon.run()
+    requests = venue.book_reads + venue.trade_reads + venue.lifecycle_reads
+    return stats, requests, clock.t
+
+
+for flag in (False, True):
+    stats, requests, elapsed = capture(flag)
+    label = "--stop-when-settled" if flag else "default"
+    print(f"{label:>20}: {stats.polls:>2} polls, {requests:>3} venue requests, "
+          f"{elapsed:>4.0f}s of the 60s asked for, "
+          f"stopped_early={stats.stopped_early}")
+EOF

@@ -920,3 +920,320 @@ def test_a_refused_settlement_also_costs_that_checks_status_update(
     assert daemon.stats.resolutions == 0
     # The check at +2s was refused; the one at +4s recorded the close.
     assert _statuses(daemon.stats.files[0]) == [(1, "open"), (7, "closed")]
+
+
+# -- retiring a market that is over ---------------------------------------
+
+
+class MultiSource(LiveSource):
+    """A source for several markets whose lifecycles move independently.
+
+    :class:`FakeSource` answers for one market and ignores the id it is
+    given, which is enough for everything above and useless here: the
+    whole question is what a capture does when one of its markets is
+    over and another is still trading. Every call records the market it
+    was asked about, so a test can assert what STOPPED being requested,
+    which is the point of the feature.
+    """
+
+    key: ClassVar[str] = "fake"
+    source_tag: ClassVar[str] = "fake-rest-poll"
+
+    def __init__(
+        self,
+        market_ids: list[str],
+        *,
+        settles: dict[str, int] | None = None,
+        closes: dict[str, int] | None = None,
+        book_errors: set[str] | None = None,
+    ) -> None:
+        self.market_ids = market_ids
+        #: market id to the describe() call index, counted per market,
+        #: at which it starts answering closed AND settled.
+        self.settles = settles or {}
+        #: market id to the index at which it starts answering closed
+        #: with no winner, which must NOT retire it.
+        self.closes = closes or {}
+        self.book_errors = book_errors or set()
+        self.describe_calls: dict[str, int] = {}
+        self.book_calls: dict[str, int] = {}
+        self.trade_calls: dict[str, int] = {}
+        self.size = 1.0
+
+    def list_markets(self, *, limit: int, search: str | None = None) -> list[MarketRef]:
+        return [MarketRef(market_id=m, title=m) for m in self.market_ids]
+
+    def describe(self, market_id: str) -> MarketDescription:
+        index = self.describe_calls.get(market_id, 0)
+        self.describe_calls[market_id] = index + 1
+        settles_at = self.settles.get(market_id)
+        closes_at = self.closes.get(market_id)
+        if settles_at is not None and index >= settles_at:
+            return MarketDescription(
+                market_id=market_id, title=market_id, status="closed", resolution=SETTLED
+            )
+        if closes_at is not None and index >= closes_at:
+            return MarketDescription(market_id=market_id, title=market_id, status="closed")
+        return MarketDescription(market_id=market_id, title=market_id, status="open")
+
+    def book(self, market_id: str) -> BookQuote:
+        self.book_calls[market_id] = self.book_calls.get(market_id, 0) + 1
+        if market_id in self.book_errors:
+            raise LiveError(f"{market_id} is gone")
+        self.size += 1.0
+        return quote({0.6: self.size}, {})
+
+    def trades(self, market_id: str, *, limit: int = 100) -> list[TradeTick]:
+        self.trade_calls[market_id] = self.trade_calls.get(market_id, 0) + 1
+        return []
+
+
+def run_multi(
+    source: MultiSource, tmp_path: Path, **config: object
+) -> tuple[CaptureDaemon, list[str]]:
+    logs: list[str] = []
+    clock = Clock()
+    settings: dict[str, object] = {
+        "markets": tuple(source.market_ids),
+        "output": tmp_path / "out.parquet",
+        "poll_interval": 1.0,
+        "duration": 10.0,
+        "status_every": 1.0,
+        # Every test using this helper is about retirement, so the flag
+        # is on by default here and the "off" case is covered against
+        # the single-market source above.
+        "stop_when_settled": True,
+    }
+    settings.update(config)
+    daemon = CaptureDaemon(
+        source,
+        CaptureConfig(**settings),  # type: ignore[arg-type]
+        now=clock.now,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+        log=logs.append,
+    )
+    daemon.run()
+    return daemon, logs
+
+
+def test_the_predicate_needs_both_halves() -> None:
+    # A status can flap and a settlement cannot, which is the whole
+    # reason both are required before anything irreversible acts on it.
+    closed_and_settled = MarketDescription(
+        market_id="M", title="M", status="closed", resolution=SETTLED
+    )
+    assert closed_and_settled.finished
+    assert not MarketDescription(market_id="M", title="M", status="closed").finished
+    assert not MarketDescription(
+        market_id="M", title="M", status="open", resolution=SETTLED
+    ).finished
+    assert not MarketDescription(market_id="M", title="M", status="halted").finished
+
+
+def test_a_capture_ends_when_its_only_market_closes_and_settles(tmp_path: Path) -> None:
+    source = FakeSource(
+        [quote({0.6: float(i)}, {}) for i in range(1, 40)],
+        statuses=["open", "closed", "closed"],
+        resolutions=[None, None, SETTLED],
+    )
+    daemon, logs = run(
+        source,
+        tmp_path,
+        poll_interval=1.0,
+        duration=30.0,
+        status_every=1.0,
+        stop_when_settled=True,
+    )
+
+    assert daemon.stats.stopped_early is True
+    assert daemon.stats.retired == 1
+    # The third describe() is the one that reports the settlement, and
+    # it runs after the third poll, so the capture is over long before
+    # the thirty seconds asked for.
+    assert daemon.stats.polls == 3
+    assert any("closed and settled" in line for line in logs)
+    # The settlement it stopped for is on the tape, so the file says why
+    # it is short without needing the log.
+    assert _resolutions(daemon.stats.files[0]) == [(6, "YES", 1.0)]
+
+
+def test_without_the_flag_the_same_capture_runs_its_full_duration(tmp_path: Path) -> None:
+    # The regression guard for the default. Ending early is a real
+    # change in what a tape covers, so it happens only when asked for.
+    source = FakeSource(
+        [quote({0.6: float(i)}, {}) for i in range(1, 40)],
+        statuses=["open", "closed", "closed"],
+        resolutions=[None, None, SETTLED],
+    )
+    daemon, _ = run(source, tmp_path, poll_interval=1.0, duration=30.0, status_every=1.0)
+
+    assert daemon.stats.stopped_early is False
+    assert daemon.stats.retired == 0
+    assert daemon.stats.polls == 30
+
+
+def test_a_closed_market_that_never_settles_does_not_end_a_capture(tmp_path: Path) -> None:
+    # A Kalshi market recorded for these fixtures closed at 17:30 UTC
+    # and was still unsettled 28 minutes later. Ending on the close
+    # alone would have thrown that wait away.
+    source = FakeSource(
+        [quote({0.6: float(i)}, {}) for i in range(1, 20)],
+        statuses=["open", "closed"],
+    )
+    daemon, _ = run(
+        source,
+        tmp_path,
+        poll_interval=1.0,
+        duration=8.0,
+        status_every=1.0,
+        stop_when_settled=True,
+    )
+
+    assert daemon.stats.stopped_early is False
+    assert daemon.stats.retired == 0
+    assert daemon.stats.polls == 8
+
+
+def test_a_flapping_status_cannot_end_a_capture_on_its_own(tmp_path: Path) -> None:
+    # Polymarket answered closed, open, closed on three reads twenty
+    # seconds apart on 2026-09-07. With no settlement published, none of
+    # those reads is grounds for stopping.
+    source = FakeSource(
+        [quote({0.6: float(i)}, {}) for i in range(1, 20)],
+        statuses=["open", "closed", "open", "closed"],
+    )
+    daemon, _ = run(
+        source,
+        tmp_path,
+        poll_interval=1.0,
+        duration=6.0,
+        status_every=1.0,
+        stop_when_settled=True,
+    )
+
+    assert daemon.stats.stopped_early is False
+    assert daemon.stats.polls == 6
+
+
+def test_one_settled_market_stops_being_polled_while_the_others_run(tmp_path: Path) -> None:
+    source = MultiSource(["A", "B"], settles={"A": 2})
+    daemon, logs = run_multi(source, tmp_path, duration=8.0)
+
+    # A settles on its third describe() and is retired; B is untouched
+    # and the capture runs its full eight polls for B.
+    assert daemon.stats.retired == 1
+    assert daemon.stats.stopped_early is False
+    assert daemon.stats.polls == 8
+    assert source.book_calls["B"] == 8
+    assert source.book_calls["A"] < 8
+    assert source.trade_calls["A"] == source.book_calls["A"]
+    assert any("A has closed and settled" in line for line in logs)
+
+
+def test_a_retired_market_stops_being_asked_about_at_all(tmp_path: Path) -> None:
+    # The lifecycle re-read is a separate request per market per check,
+    # and it is the only per-market cost a streamed capture pays, so
+    # narrowing it is half the feature rather than a detail.
+    source = MultiSource(["A", "B"], settles={"A": 2})
+    run_multi(source, tmp_path, duration=8.0)
+
+    assert source.describe_calls["B"] > source.describe_calls["A"]
+    # One at open plus the checks that ran before it retired, and not
+    # one after.
+    assert source.describe_calls["A"] == 3
+
+
+def test_a_retired_market_leaves_the_segment_that_ended_it_complete(tmp_path: Path) -> None:
+    # A segment describes the markets it has events for and no others,
+    # which is the rule that already governed a quiet market and is
+    # what a retired one becomes. So the segment that watched A settle
+    # carries A's whole story, and the segment after it does not open
+    # with a header for a market it observed nothing about.
+    source = MultiSource(["A", "B"], settles={"A": 1})
+    daemon, _ = run_multi(source, tmp_path, duration=8.0, rotate_after=4.0)
+
+    assert len(daemon.stats.files) == 2
+    first = list(Tape.read(daemon.stats.files[0]).replay(speed="max"))
+    assert {e.market_id for e in first if isinstance(e, Market)} == {"A", "B"}
+    a_rows = [e for e in first if e.market_id == "A"]
+    assert [type(e).__name__ for e in a_rows if not isinstance(e, BookDelta)] == [
+        "Market",
+        "MarketStatus",
+        "OrderBookSnapshot",
+        "MarketStatus",
+        "Resolution",
+    ]
+    assert [e.status for e in a_rows if isinstance(e, MarketStatus)] == ["open", "closed"]
+
+    last = list(Tape.read(daemon.stats.files[-1]).replay(speed="max"))
+    assert {e.market_id for e in last} == {"B"}
+
+
+def test_the_capture_ends_only_once_every_market_has_settled(tmp_path: Path) -> None:
+    source = MultiSource(["A", "B"], settles={"A": 1, "B": 4})
+    daemon, _ = run_multi(source, tmp_path, duration=30.0)
+
+    assert daemon.stats.retired == 2
+    assert daemon.stats.stopped_early is True
+    # B settles on its fifth describe(): one at open, then one per poll
+    # from the second poll onward, since the first poll happens before
+    # the clock has advanced far enough for a check to be due.
+    assert daemon.stats.polls == 5
+    # A settled at the check that followed the second poll, so it was
+    # polled twice and then never again, while B was polled all five
+    # times. That difference IS the narrowing.
+    assert source.book_calls == {"A": 2, "B": 5}
+
+
+def test_a_market_closed_but_unsettled_holds_the_capture_open(tmp_path: Path) -> None:
+    # B closes and never settles, so the capture must run its duration
+    # even though A is finished. Stopping here would end the capture in
+    # exactly the window a settlement is most likely to arrive.
+    source = MultiSource(["A", "B"], settles={"A": 1}, closes={"B": 1})
+    daemon, _ = run_multi(source, tmp_path, duration=6.0)
+
+    assert daemon.stats.retired == 1
+    assert daemon.stats.stopped_early is False
+    assert daemon.stats.polls == 6
+
+
+def test_a_market_already_settled_at_the_start_still_gets_one_poll(tmp_path: Path) -> None:
+    # Retirement is evaluated after the poll, so a capture asked for a
+    # market that is already over produces a picture of how it ended
+    # rather than an empty directory.
+    source = MultiSource(["A"], settles={"A": 0})
+    daemon, _ = run_multi(source, tmp_path, duration=30.0)
+
+    assert daemon.stats.stopped_early is True
+    assert daemon.stats.polls == 1
+    assert source.book_calls["A"] == 1
+    rows = list(Tape.read(daemon.stats.files[0]).replay(speed="max"))
+    assert [type(e).__name__ for e in rows] == [
+        "Market",
+        "MarketStatus",
+        "Resolution",
+        "OrderBookSnapshot",
+    ]
+
+
+def test_the_failure_limit_counts_against_the_markets_still_being_polled(
+    tmp_path: Path,
+) -> None:
+    # With A retired, B failing every poll IS every market failing.
+    # Comparing against the markets the user named instead would let the
+    # only live market fail forever without ever tripping the limit.
+    source = MultiSource(["A", "B"], settles={"A": 1}, book_errors={"B"})
+    with pytest.raises(LiveError, match="every market failed to poll"):
+        run_multi(source, tmp_path, duration=30.0, max_consecutive_failures=3)
+
+
+def test_a_settled_market_whose_book_is_gone_still_ends_the_capture(tmp_path: Path) -> None:
+    # The venue 404s a dead market's book, so the one poll it gets
+    # yields nothing and no tape is written. That is not a failure to
+    # report as one; there was nothing to record.
+    source = MultiSource(["A"], settles={"A": 0}, book_errors={"A"})
+    daemon, _ = run_multi(source, tmp_path, duration=30.0, max_consecutive_failures=5)
+
+    assert daemon.stats.stopped_early is True
+    assert daemon.stats.files == []
