@@ -4,8 +4,9 @@ This adapter converts files whose shape follows the public Polymarket
 CLOB conventions: prices as decimal strings ("0.62"), sizes as decimal
 strings, sides "BUY"/"SELL", unix-second or unix-millisecond
 timestamps, hex condition ids. It works on local JSON files shaped like
-the documented API payloads; it does not talk to any API (live capture
-is roadmap, see ROADMAP.md).
+the documented API payloads; it does not talk to any API. To read the
+venue directly, see :mod:`opentape.live.polymarket`, which maps the
+same conventions off the live endpoints.
 
 Expected input: one JSON object with any of these keys.
 

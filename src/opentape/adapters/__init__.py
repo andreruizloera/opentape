@@ -4,8 +4,12 @@ Adapter contract: each adapter module exposes
 
     convert(path: str | Path) -> Tape
 
-taking a local file and returning a validated, sequenced Tape. Adapters
-never perform network I/O; live capture belongs to the roadmap.
+taking a local file and returning a validated, sequenced Tape.
+Adapters never perform network I/O. Reading a venue directly is a
+different interface, :class:`opentape.live.LiveSource`, because a
+converter and a poller have different shapes: one is handed all the
+data at once, the other has to ask repeatedly and work out what
+changed.
 """
 
 from __future__ import annotations

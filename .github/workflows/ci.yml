@@ -29,3 +29,5 @@ jobs:
           uv run opentape replay examples/sample.parquet --limit 5
           uv run opentape convert examples/fixtures/kalshi_style.json --format kalshi-style -o /tmp/k.parquet
           uv run opentape inspect /tmp/k.parquet
+          uv run opentape capture --help
+          uv run opentape markets --help

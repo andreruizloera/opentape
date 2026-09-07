@@ -19,6 +19,14 @@ from opentape.events import (
     Resolution,
     Trade,
 )
+from opentape.live import (
+    SOURCES,
+    CaptureConfig,
+    CaptureDaemon,
+    HttpFetcher,
+    build_source,
+    parse_duration,
+)
 from opentape.tape import Tape
 
 
@@ -137,6 +145,52 @@ def _cmd_convert(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_markets(args: argparse.Namespace) -> int:
+    source = build_source(args.venue, HttpFetcher(timeout=args.timeout))
+    refs = source.list_markets(limit=args.limit, search=args.search)
+    if not refs:
+        what = f" matching {args.search!r}" if args.search else ""
+        print(f"no open {args.venue} markets{what}")
+        return 0
+    width = max(len(r.market_id) for r in refs)
+    for ref in refs:
+        detail = f"  ({ref.detail})" if ref.detail else ""
+        print(f"{ref.market_id:<{width}}  {ref.title}{detail}")
+    return 0
+
+
+def _cmd_capture(args: argparse.Namespace) -> int:
+    source = build_source(args.venue, HttpFetcher(timeout=args.timeout))
+    config = CaptureConfig(
+        markets=tuple(args.market),
+        output=Path(args.output),
+        poll_interval=parse_duration(args.poll, flag="--poll"),
+        duration=parse_duration(args.duration, flag="--duration") if args.duration else None,
+        rotate_after=parse_duration(args.rotate, flag="--rotate") if args.rotate else None,
+        resnapshot_every=args.snapshot_every,
+        backfill=args.backfill,
+    )
+    log = (lambda msg: None) if args.quiet else (lambda msg: print(msg, flush=True))
+    if not args.quiet:
+        span = f" for {args.duration}" if args.duration else " until interrupted"
+        print(f"capturing {len(config.markets)} market(s) from {args.venue}{span}")
+        print(f"polling every {args.poll}; press Ctrl-C to stop and write what has been captured")
+    daemon = CaptureDaemon(source, config, log=log)
+    stats = daemon.run()
+    print(
+        f"captured {stats.events:,} events over {stats.polls:,} polls "
+        f"({stats.snapshots:,} snapshots, {stats.deltas:,} deltas, {stats.trades:,} trades"
+        + (f", {stats.failed_polls:,} failed polls" if stats.failed_polls else "")
+        + ")"
+    )
+    if not stats.files:
+        print("no events were captured, so no tape was written")
+        return 1
+    for path in stats.files:
+        print(f"wrote {path}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="opentape",
@@ -172,6 +226,66 @@ def build_parser() -> argparse.ArgumentParser:
         "-o", "--output", default=None, help="output .parquet path (default: input with .parquet)"
     )
     p_convert.set_defaults(func=_cmd_convert)
+
+    p_markets = sub.add_parser("markets", help="list open markets on a live venue")
+    p_markets.add_argument("--venue", required=True, choices=sorted(SOURCES), help="venue to query")
+    p_markets.add_argument("--limit", type=int, default=20, help="how many markets to show")
+    p_markets.add_argument("--search", default=None, help="only show markets matching this text")
+    p_markets.add_argument(
+        "--timeout", type=float, default=10.0, help="per-request timeout in seconds"
+    )
+    p_markets.set_defaults(func=_cmd_markets)
+
+    p_capture = sub.add_parser(
+        "capture",
+        help="poll a live venue and write canonical tapes",
+        description="Poll a venue's public endpoints on an interval and write a canonical "
+        "tape. Only unauthenticated endpoints are used, so no credentials are needed. "
+        "A poll interval is a sampling rate, not a subscription: changes that happen and "
+        "reverse between two polls are not captured, and the source column records that "
+        "the tape was polled.",
+    )
+    p_capture.add_argument("--venue", required=True, choices=sorted(SOURCES), help="venue to poll")
+    p_capture.add_argument(
+        "--market",
+        action="append",
+        required=True,
+        metavar="ID",
+        help="market to capture; repeat for several (see 'opentape markets')",
+    )
+    p_capture.add_argument("-o", "--output", required=True, help="output .parquet path")
+    p_capture.add_argument("--poll", default="2s", help="poll interval (default 2s)")
+    p_capture.add_argument(
+        "--duration", default=None, help="stop after this long (default: run until interrupted)"
+    )
+    p_capture.add_argument(
+        "--rotate",
+        default=None,
+        help="write a numbered tape segment this often, instead of one file at the end",
+    )
+    p_capture.add_argument(
+        "--snapshot-every",
+        type=int,
+        default=0,
+        metavar="N",
+        help="re-emit a full book snapshot every N polls, so a tape has recovery points "
+        "(default 0, meaning only on the first poll and after a failed one)",
+    )
+    p_capture.add_argument(
+        "--backfill",
+        type=int,
+        default=0,
+        metavar="N",
+        help="also keep up to N already-executed trades per market from the first poll "
+        "(default 0: the tape holds only trades observed to arrive during the capture). "
+        "Backfilled trades carry their venue timestamp, so they sort before the market "
+        "definition row that opens the tape",
+    )
+    p_capture.add_argument(
+        "--timeout", type=float, default=10.0, help="per-request timeout in seconds"
+    )
+    p_capture.add_argument("--quiet", action="store_true", help="only print the final summary")
+    p_capture.set_defaults(func=_cmd_capture)
     return parser
 
 

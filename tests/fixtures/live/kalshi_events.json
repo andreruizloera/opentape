@@ -1,0 +1,49 @@
+{
+  "cursor": "",
+  "events": [
+    {
+      "category": "World",
+      "event_ticker": "KXELONMARS-99",
+      "markets": [
+        {
+          "market_type": "binary",
+          "ticker": "KXELONMARS-99",
+          "title": "Will Elon Musk visit Mars before Aug 1, 2099?",
+          "yes_ask_dollars": "0.1200",
+          "yes_bid_dollars": "0.1000",
+          "yes_sub_title": "Mars"
+        }
+      ]
+    },
+    {
+      "category": "Elections",
+      "event_ticker": "KXNEXTNATOSECGEN-99",
+      "markets": [
+        {
+          "market_type": "binary",
+          "ticker": "KXNEXTNATOSECGEN-99-KIOH",
+          "title": "Will Klaus Iohannis be the next Secretary General of NATO?",
+          "yes_ask_dollars": "0.1200",
+          "yes_bid_dollars": "0.0700",
+          "yes_sub_title": "Klaus Iohannis"
+        },
+        {
+          "market_type": "binary",
+          "ticker": "KXNEXTNATOSECGEN-99-KKAL",
+          "title": "Will Kaja Kallas be the next Secretary General of NATO?",
+          "yes_ask_dollars": "0.1600",
+          "yes_bid_dollars": "0.1100",
+          "yes_sub_title": "Kaja Kallas"
+        },
+        {
+          "market_type": "binary",
+          "ticker": "KXNEXTNATOSECGEN-99-BWAL",
+          "title": "Will Ben Wallace be the next Secretary General of NATO?",
+          "yes_ask_dollars": "0.2700",
+          "yes_bid_dollars": "0.1800",
+          "yes_sub_title": "Ben Wallace"
+        }
+      ]
+    }
+  ]
+}

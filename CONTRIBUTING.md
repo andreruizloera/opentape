@@ -24,6 +24,12 @@ All three must pass. CI runs the same commands.
 
 - New behavior needs a test. Adapter changes need a fixture under
   `examples/fixtures/` that exercises the documented input shape.
+- Tests never touch the network. Live sources take an injected
+  fetcher, so a new venue is tested against a recorded payload in
+  `tests/fixtures/live/`; record a real response and trim it rather
+  than inventing one, and strip anything that identifies a trader.
+  `./demo_live.sh` is the only script that goes online, and CI does
+  not run it.
 - Schema changes are the most sensitive kind of change: they need an
   update to SCHEMA.md, a decision about `SCHEMA_VERSION`, and
   round-trip tests. Open an issue first.

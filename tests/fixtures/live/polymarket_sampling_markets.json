@@ -1,0 +1,36 @@
+{
+  "data": [
+    {
+      "active": true,
+      "closed": false,
+      "condition_id": "0xa467b14d51f01b957109d9cbb1d6c124fab2a089d52ed8f471d23c2812e743b7",
+      "end_date_iso": "2027-01-01T00:00:00Z",
+      "market_slug": "xi-jinping-out-before-2027",
+      "question": "Xi Jinping out before 2027?"
+    },
+    {
+      "active": true,
+      "closed": false,
+      "condition_id": "0x0f49db97f71c68b1e42a6d16e3de93d85dbf7d4148e3f018eb79e88554be9f75",
+      "end_date_iso": "2028-11-07T00:00:00Z",
+      "market_slug": "will-gavin-newsom-win-the-2028-democratic-presidential-nomination-568",
+      "question": "Will Gavin Newsom win the 2028 Democratic presidential nomination?"
+    },
+    {
+      "active": true,
+      "closed": false,
+      "condition_id": "0xe6bcc2f1dd025ce5e1833190f7c60a71171c94f805df55b9ab0ded695ec93565",
+      "end_date_iso": "2028-11-07T00:00:00Z",
+      "market_slug": "will-alexandria-ocasio-cortez-win-the-2028-democratic-presidential-nomination-653",
+      "question": "Will Alexandria Ocasio-Cortez win the 2028 Democratic presidential nomination?"
+    },
+    {
+      "active": true,
+      "closed": false,
+      "condition_id": "0x4c325469d9b516ef4e6b8f73a81a12607dec075e3c2fd454f91765aaeafc4760",
+      "end_date_iso": "2028-11-07T00:00:00Z",
+      "market_slug": "will-pete-buttigieg-win-the-2028-democratic-presidential-nomination-687",
+      "question": "Will Pete Buttigieg win the 2028 Democratic presidential nomination?"
+    }
+  ]
+}

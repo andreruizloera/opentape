@@ -4,8 +4,9 @@ This adapter converts files whose shape follows the public Kalshi API
 conventions: prices in integer cents (1 to 99), binary YES/NO markets,
 order books quoted as resting YES bids and NO bids, taker side named
 "yes" or "no". It works on local JSON files shaped like the documented
-API payloads; it does not talk to any API (live capture is roadmap,
-see ROADMAP.md).
+API payloads; it does not talk to any API. To read the venue
+directly, see :mod:`opentape.live.kalshi`, which maps the same
+conventions off the live endpoints.
 
 Expected input: one JSON object with any of these keys.
 

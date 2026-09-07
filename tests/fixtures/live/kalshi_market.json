@@ -1,0 +1,14 @@
+{
+  "market": {
+    "close_time": "2099-08-01T04:59:00Z",
+    "last_price_dollars": "0.1200",
+    "market_type": "binary",
+    "open_time": "2025-08-28T20:45:00Z",
+    "status": "active",
+    "ticker": "KXELONMARS-99",
+    "title": "Will Elon Musk visit Mars before Aug 1, 2099?",
+    "yes_ask_dollars": "0.1200",
+    "yes_bid_dollars": "0.1000",
+    "yes_sub_title": "Mars"
+  }
+}

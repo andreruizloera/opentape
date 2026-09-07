@@ -1,16 +1,34 @@
 # Roadmap
 
-Honest future work: none of this is implemented today.
+Honest future work. Everything below is unimplemented unless a section
+says otherwise.
 
 ## Live capture
 
-- Kalshi capture daemon: authenticate against the real Kalshi API,
-  subscribe to the websocket orderbook and trade channels, and write
-  rotating tapes. The `kalshi-style` adapter documents the mapping;
-  the daemon is the missing transport.
-- Polymarket capture daemon: same, over the CLOB websocket and REST
-  backfill endpoints.
-- Gap detection and re-snapshot logic when a feed drops.
+`opentape capture` SHIPPED, over the public unauthenticated REST
+endpoints of Kalshi and Polymarket, with rotation and with
+re-snapshotting after a dropped poll. See the README. What is still
+open:
+
+- Websocket transports for both venues, so the tape stops being a
+  sample of the book and becomes the venue's own change stream.
+  Kalshi's orderbook and trade channels and Polymarket's CLOB socket
+  are the two targets, and both would keep the same `LiveSource`
+  boundary the REST sources use.
+- Authenticated feeds: Kalshi's signed API and Polymarket's
+  authenticated CLOB endpoints, both of which need keys. The fetcher
+  is already injected, so this is a credentials and signing question
+  rather than a structural one.
+- Re-read a market's status while a capture runs, so a market that
+  closes or halts mid-capture records the change instead of keeping
+  the status it had when the capture started.
+- Adaptive poll pacing: back off on a market whose book has not moved
+  in a while and spend the request budget on the ones that are, which
+  matters once a single capture tracks many markets.
+- Rate-limit awareness beyond retrying a 429, including a shared
+  budget across markets in one capture.
+- A `--markets-from` file so a long capture can track a list without a
+  command line full of tickers.
 
 ## Format
 

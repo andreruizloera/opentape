@@ -1,0 +1,24 @@
+{
+  "accepting_orders": true,
+  "active": true,
+  "closed": false,
+  "condition_id": "0xa467b14d51f01b957109d9cbb1d6c124fab2a089d52ed8f471d23c2812e743b7",
+  "end_date_iso": "2027-01-01T00:00:00Z",
+  "market_slug": "xi-jinping-out-before-2027",
+  "minimum_tick_size": 0.001,
+  "question": "Xi Jinping out before 2027?",
+  "tokens": [
+    {
+      "outcome": "Yes",
+      "price": 0.0425,
+      "token_id": "32338220190071351435772801779725302244575775216413325951443816017994629993401",
+      "winner": false
+    },
+    {
+      "outcome": "No",
+      "price": 0.9575,
+      "token_id": "25659310674993675562345759665114759892400026242514633218387667107987341231962",
+      "winner": false
+    }
+  ]
+}

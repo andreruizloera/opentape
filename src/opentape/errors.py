@@ -13,3 +13,7 @@ class SchemaError(OpenTapeError):
 
 class AdapterError(OpenTapeError):
     """An input file could not be converted into the canonical schema."""
+
+
+class LiveError(OpenTapeError):
+    """A live feed could not be reached, or answered with something unusable."""

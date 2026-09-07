@@ -1,0 +1,30 @@
+name: Live check
+
+# Runs a real capture against both venues' public endpoints.
+#
+# Manual only, deliberately. The recorded payloads in
+# tests/fixtures/live/ are the risk this job exists to manage: if a
+# venue renames a field, the offline suite keeps passing against the
+# old shape while the real thing breaks. But a job whose result
+# depends on someone else's uptime does not belong on the push path,
+# where a venue outage would read as a broken commit. Run it by hand
+# when touching a live source, or to check whether the fixtures have
+# gone stale.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: uv sync
+      - name: Kalshi
+        run: ./demo_live.sh kalshi 20s
+      - name: Polymarket
+        run: ./demo_live.sh polymarket 20s

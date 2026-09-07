@@ -16,7 +16,18 @@ Notes for integrators:
   functions.
 - Adapter inputs are fully parsed before conversion; very large files
   will use memory accordingly.
-- opentape performs no network I/O anywhere.
+- `opentape capture` and `opentape markets` make outbound HTTPS
+  requests to the venue whose name you pass, and nothing else does any
+  network I/O. All of it goes through `opentape.live.http`, which
+  sends no credentials, reads no environment variables, and only ever
+  issues GETs. The venue's JSON is treated as untrusted input and is
+  validated into `LiveError` failures rather than trusted.
+- A capture writes the venue's own market titles into the tape
+  verbatim. Those strings come from a third party; treat them as you
+  would any untrusted text if you render them.
+- No credentials are stored or required, because only unauthenticated
+  endpoints are used. If you add an authenticated source, keep the key
+  out of the repository and out of the tape.
 
 ## Reporting a vulnerability
 
